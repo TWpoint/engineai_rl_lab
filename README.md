@@ -1,6 +1,7 @@
 # engineai_rl_lab
-[![IsaacSim](https://img.shields.io/badge/IsaacSim-5.1.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
-[![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.3.2-silver)](https://isaac-sim.github.io/IsaacLab)
+[![Isaac Lab](https://img.shields.io/badge/IsaacLab-3.0_beta2+-silver)](https://github.com/isaac-sim/IsaacLab/releases)
+[![Newton](https://img.shields.io/badge/Physics-Newton_MJWarp-blue)](https://github.com/newton-physics/newton)
+[![Isaac Sim](https://img.shields.io/badge/Optional-Isaac_Sim_6.0.1-silver)](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/overview/index.html)
 
 [English](README_EN.md)
 
@@ -12,42 +13,115 @@
 |**T800**|<img src="./docs/train.gif" height="180"/>|<img src="./docs/sim2sim.gif" height="180"/>|<img src="./docs/deploy.gif" height="180"/>|
 |**PM01**|<img src="./docs/train_pm.gif" height="180"/>|<img src="./docs/sim2sim_pm.gif" height="180"/>|<img src="./docs/deploy_pm.gif" height="180"/>|
 
-## 安装
-### 安装Isaac Lab
-本仓库基于Isaac Lab2.3.2的commit `c22775241e28f465fe345fa1a482ad6d29d712b0`进行开发,不同版本之间代码可能不通用。关于Isaac Lab的详细安装步骤，请参阅其官方安装指南[Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html)
+## 兼容性
 
-### 安装engineai_rl_lab
-1. 从github克隆engineai_rl_lab
+当前代码面向 Isaac Lab 3.0，迁移和验证基线为 `develop` 分支提交 `891116e68dac3d417cb5de2d722d16d44ae3f06d`，并使用 Isaac Lab 3.0 Beta 2 引入的多物理后端和 preset CLI。3.0 仍在快速迭代；升级 Isaac Lab 后请先阅读[官方发布说明](https://github.com/isaac-sim/IsaacLab/releases)和[迁移指南](https://isaac-sim.github.io/IsaacLab/develop/source/migration/migrating_to_isaaclab_3-0.html)。
+
+- Newton MJWarp 可在不安装 Isaac Sim 的情况下运行；训练时选择 `physics=newton_mjwarp`。
+- Isaac Sim PhysX/Kit 是可选后端，需要 Isaac Sim 6.0.1；选择 `physics=isaacsim_physx --viz kit`。
+- Isaac Lab 3.0 要求 Python 3.12，并将四元数顺序改为 XYZW、资产数据改为 Warp-backed 数组。
+- 当前基线中的 MJWarp 不强制执行 actuator 的 `velocity_limit`/`velocity_limit_sim`；不要把它当作训练或真机安全限速，策略侧限幅与部署侧安全检查仍然必须保留。
+- `SimulationCfg.use_newton_actuators` 必须保持为 `False`（当前配置已显式固定），否则 Newton 原生 actuator 路径会绕过 T800 的 Python 延迟执行器。
+
+## 安装
+
+### 准备 Git LFS
+
+机器人 USD、示例 checkpoint 等文件由 Git LFS 管理。必须先安装并初始化 Git LFS，再拉取仓库内容；否则 USD 文件只是约 130 字节的文本指针，仿真无法加载机器人。在 Ubuntu 上运行：
+
 ```bash
+sudo apt-get update
+sudo apt-get install -y git-lfs
+git lfs install
+```
+
+先将变量设为包含 `IsaacLab` 和本仓库的工作区目录。当前机器可使用
+`export ENGINEAI_WORKSPACE=/home/ubuntu/engineai-newton`；其他机器请替换示例路径：
+
+```bash
+export ENGINEAI_WORKSPACE=/path/to/your/workspace
+cd "$ENGINEAI_WORKSPACE"
+```
+
+如果工作区中已经有仓库，直接补拉 LFS 文件：
+
+```bash
+git -C engineai_rl_lab lfs pull
+```
+
+全新工作区则应在 `git lfs install` 之后克隆：
+
+```bash
+cd "$ENGINEAI_WORKSPACE"
 git clone https://github.com/engineai-robotics/engineai_rl_lab.git
+git -C engineai_rl_lab lfs pull
 ```
-2. 安装engineai_rl_lab
+
+### 安装 Isaac Lab 3.0 和 Newton
+
+下面假设 `IsaacLab`、Python 3.12 虚拟环境 `engineai-newton` 和本仓库都位于
+`$ENGINEAI_WORKSPACE` 下：
+
 ```bash
-# 请确保已经激活isaaclab环境
-cd engineai_rl_lab
-pip install -e source/engineai_rl_lab
+cd "$ENGINEAI_WORKSPACE"
+source "$ENGINEAI_WORKSPACE/engineai-newton/bin/activate"
+
+cd IsaacLab
+./isaaclab.sh -i 'newton,rl[rsl-rl],visualizer[newton]'
 ```
+
+这会安装 Newton、RSL-RL 和 Newton visualizer，但不会安装 Isaac Sim。若还需要 PhysX/Kit，请改用：
+
+```bash
+./isaaclab.sh -i 'isaacsim,newton,rl[rsl-rl],visualizer[kit]'
+```
+
+全新环境请按 Isaac Lab 3.0 官方流程创建 Python 3.12 环境，并在 IsaacLab 根目录运行 `./isaaclab.sh -i`。详细步骤见 [Isaac Lab 安装指南](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)。
+
+### 安装 engineai_rl_lab
+
+`isaaclab.sh` 执行结束后当前目录仍是 `IsaacLab`，因此用工作区变量回到本仓库，再在同一个已激活环境中安装：
+
+```bash
+cd "$ENGINEAI_WORKSPACE/engineai_rl_lab"
+python -m pip install -e source/engineai_rl_lab
+python -m pip check
+python -c "import isaaclab, isaaclab_newton, newton, warp, rsl_rl, engineai_rl_lab; print('environment ready')"
+```
+
+仅看到 `isaaclab` 的 editable 安装并不代表环境完整；上面的导入检查还会确认 Newton、Warp 相关依赖和 RSL-RL 已实际安装。
 
 ## 训练
 ### whole body tracking
+
+以下命令都应从仓库根目录 `$ENGINEAI_WORKSPACE/engineai_rl_lab` 运行，并保持上述虚拟环境处于激活状态。当前四个脚本省略 physics selector 时都会使用 Isaac Sim PhysX；使用 Newton 时请保留示例中的 selector。两类脚本的写法不同：
+
+- `train.py` / `play.py` 使用 Hydra preset token：`physics=newton_mjwarp`，前面没有 `--`。
+- `csv_to_npz.py` / `replay_npz.py` 使用 argparse 选项：`--physics newton_mjwarp`。
+
 1. 将csv文件转换npz文件
 ```bash
-# csv文件转换为npz文件,npz文件在同一目录下
-python scripts/csv_to_npz.py --robot pm01 --input_fps 30 -f datasets/tracking/pm01/dance.csv
-python scripts/csv_to_npz.py --robot t800 --input_fps 30 -f datasets/tracking/t800/dance_t800.csv
+# 仓库自带 CSV 为 XYZW；显式声明输入顺序。生成的 NPZ 始终保存为 Isaac Lab 3.0 的 XYZW
+python scripts/csv_to_npz.py --robot pm01 --input_fps 30 --input_quaternion_order xyzw -f datasets/tracking/pm01/dance.csv --physics newton_mjwarp
+python scripts/csv_to_npz.py --robot t800 --input_fps 30 --input_quaternion_order xyzw -f datasets/tracking/t800/dance_t800.csv --physics newton_mjwarp
 
-# 重放npz文件
-python scripts/replay_npz.py --robot pm01 --input_file datasets/tracking/pm01/dance.npz
-python scripts/replay_npz.py --robot t800 --input_file datasets/tracking/t800/dance_t800.npz
+# 如果外部 CSV 的第 4–7 列是 WXYZ，请改用：
+python scripts/csv_to_npz.py --robot pm01 --input_fps 30 --input_quaternion_order wxyz -f path/to/motion.csv --physics newton_mjwarp
+
+# 使用 Newton visualizer 重放 NPZ
+python scripts/replay_npz.py --robot pm01 --input_file datasets/tracking/pm01/dance.npz --physics newton_mjwarp --viz newton_gl
+python scripts/replay_npz.py --robot t800 --input_file datasets/tracking/t800/dance_t800.npz --physics newton_mjwarp --viz newton_gl
 ```
+
+转换器支持 `--input_quaternion_order {xyzw,wxyz}`，内部会统一转为 XYZW。仓库内已有的旧 NPZ 没有 `quaternion_order` 和 `body_names` 元数据；加载器会按旧版 WXYZ 读取并自动转为 XYZW，body 顺序则依靠机器人配置中固定的 PhysX 顺序兼容。请勿手动批量改写这些二进制数据。
 
 2. 训练
 ```bash
 # PM01
-python scripts/tracking/train.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --headless --num_envs 4096 --motion_file datasets/tracking/pm01/dance.npz
+python scripts/tracking/train.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --num_envs 4096 --motion_file datasets/tracking/pm01/dance.npz physics=newton_mjwarp
 
 # T800
-python scripts/tracking/train.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --headless --num_envs 4096 --motion_file datasets/tracking/t800/dance_t800.npz
+python scripts/tracking/train.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --num_envs 4096 --motion_file datasets/tracking/t800/dance_t800.npz physics=newton_mjwarp
 
 # 查看训练日志
 python -m tensorboard.main --logdir logs
@@ -56,11 +130,13 @@ python -m tensorboard.main --logdir logs
 3. 验证训练效果并导出策略
 ```bash
 # PM01
-python scripts/tracking/play.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/pm01/dance.npz --load_run 2026-06-23_09-58-43 --checkpoint dance.pt
+python scripts/tracking/play.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/pm01/dance.npz --load_run 2026-06-23_09-58-43 --checkpoint dance.pt physics=newton_mjwarp --viz newton_gl
 
 # T800
-python scripts/tracking/play.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/t800/dance_t800.npz --load_run 2026-06-28_20-47-15 --checkpoint dance.pt
+python scripts/tracking/play.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/t800/dance_t800.npz --load_run 2026-06-28_20-47-15 --checkpoint dance.pt physics=newton_mjwarp --viz newton_gl
 ```
+
+`--viz newton_gl` 会打开 Newton GL visualizer。本项目当前配置省略 `--viz` 时不会启动 visualizer；`--viz none` 可显式禁用所有 visualizer。此基线已从命令行解析器移除 `--headless` 和 `--enable_cameras`，不要再传这两个旧参数；若需控制 Kit 的无窗口运行模式，可使用 `HEADLESS=1` 环境变量，但 visualizer 的启停仍由 `--viz` 决定。可用 `python scripts/tracking/train.py --task <TASK_ID> --help` 查看任务声明的 physics presets。
 
 ## 部署
 ### 安装engineai_robotics_native_sdk

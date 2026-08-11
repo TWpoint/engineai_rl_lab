@@ -7,23 +7,24 @@ version = "0.1.0"
 category = "isaaclab"
 readme  = "README.md"
 
-title = "Extension Template"
-author = "Isaac Lab Project Developers"
-maintainer = "Isaac Lab Project Developers"
-description="Extension Template for Isaac Lab"
-repository = "https://github.com/isaac-sim/IsaacLab.git"
-keywords = ["extension", "template", "isaaclab"]
+title = "EngineAI RL Lab"
+author = "EngineAI Robotics"
+maintainer = "EngineAI Robotics"
+description = "Isaac Lab environments for EngineAI robot reinforcement learning and whole-body tracking"
+repository = "https://github.com/engineai-robotics/engineai_rl_lab.git"
+keywords = ["robotics", "reinforcement-learning", "whole-body-tracking", "isaaclab", "newton"]
 
 [dependencies]
 "isaaclab" = {}
-"isaaclab_assets" = {}
-"isaaclab_mimic" = {}
 "isaaclab_rl" = {}
 "isaaclab_tasks" = {}
-# NOTE: Add additional dependencies here
 
 [[python.module]]
 name = "engineai_rl_lab"
+
+# Keep the Kit-only UI module separate so importing the package remains valid in Newton kit-less runs.
+[[python.module]]
+name = "engineai_rl_lab.ui_extension_example"
 
 [isaac_lab_settings]
 # TODO: Uncomment and list any apt dependencies here.

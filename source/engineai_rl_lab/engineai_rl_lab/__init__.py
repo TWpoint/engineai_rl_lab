@@ -3,13 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""
-Python module serving as a project/extension template.
-"""
+"""EngineAI reinforcement-learning environments for Isaac Lab."""
 
 # Register Gym environments.
-from .tasks import *
-from .tasks.tracking.robots import *
-
-# Register UI extensions.
-from .ui_extension_example import *
+from . import tasks as tasks

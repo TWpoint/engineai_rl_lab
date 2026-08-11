@@ -7,44 +7,47 @@
     python scripts/replay_npz.py --robot t800 --input_file <path_to_motion.npz>
 """
 
-"""Launch Isaac Sim Simulator first."""
+"""Parse CLI arguments before selecting an Isaac Lab physics backend."""
 
 import argparse
+
 import numpy as np
 import torch
 
-from isaaclab.app import AppLauncher
+from isaaclab.app import add_launcher_args, launch_simulation
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
 parser.add_argument("--registry_name", type=str, default=None, help="The name of the wandb registry.")
 parser.add_argument("--input_file", type=str, default=None, help="Path to a local .npz motion file.")
 parser.add_argument("--robot", type=str, default="pm01", choices=["pm01", "t800"], help="Robot type to use.")
+parser.add_argument(
+    "--physics",
+    default="isaacsim_physx",
+    choices=["isaacsim_physx", "newton_mjwarp"],
+    help="Physics backend used to load and replay the robot.",
+)
 
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
+# append simulation launcher cli args
+add_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-"""Rest everything follows."""
-
-import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, ArticulationCfg, AssetBaseCfg
-from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
-from isaaclab.sim import SimulationContext
-from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from engineai_rl_lab.tasks.tracking.mdp.commands import MotionLoader
 
 ##
 # Pre-defined configs
 ##
 from engineai_rl_lab.tasks.tracking.robots.pm01 import PM01_CYLINDER_CFG
 from engineai_rl_lab.tasks.tracking.robots.t800 import T800_CYLINDER_CFG
-from engineai_rl_lab.tasks.tracking.mdp.commands import MotionLoader
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation, ArticulationCfg, AssetBaseCfg
+from isaaclab.physics import PhysicsCfg
+from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.sim import SimulationContext
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.configclass import configclass
 
 ROBOT_CFGS = {
     "pm01": PM01_CYLINDER_CFG,
@@ -93,87 +96,53 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     motion = MotionLoader(
         motion_file,
-        torch.tensor([0], dtype=torch.long, device=sim.device),
-        sim.device,
+        joint_names=robot.joint_names,
+        body_names=robot.body_names,
+        body_indexes=torch.arange(len(robot.body_names), dtype=torch.long, device=sim.device),
+        device=sim.device,
     )
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
-    num_motion_joints = motion.joint_pos.shape[-1]
-    num_sim_joints = robot.data.default_joint_pos.shape[-1]
-    motion_joint_names = getattr(motion, "joint_names", None)
-
-    if motion_joint_names is not None:
-        robot_joint_indexes = robot.find_joints(motion_joint_names, preserve_order=True)[0]
-        num_robot_joints = len(robot_joint_indexes)
-        print(
-            f"[INFO]: Motion has {num_motion_joints} named joint columns. Replaying with file joint-name order."
-        )
-    elif num_motion_joints == num_sim_joints:
-        robot_joint_indexes = slice(None)
-        num_robot_joints = num_sim_joints
-        print(
-            f"[INFO]: Motion has {num_motion_joints} joint columns, matching robot simulation joint order. "
-            "Replaying joints in native order."
-        )
-    else:
-        robot_joint_indexes = robot.find_joints(scene.cfg.robot.joint_sdk_names, preserve_order=True)[0]
-        num_robot_joints = len(robot_joint_indexes)
-        print(
-            f"[INFO]: Motion has {num_motion_joints} joint columns. Replaying with "
-            f"{num_robot_joints} configured SDK joints."
-        )
-
-    if num_motion_joints < num_robot_joints:
-        raise RuntimeError(
-            f"Motion has {num_motion_joints} joint columns, but robot '{args_cli.robot}' expects "
-            f"{num_robot_joints} joints."
-        )
-    if num_motion_joints > num_robot_joints:
-        print(
-            f"[WARN]: Motion has {num_motion_joints} joint columns, but robot '{args_cli.robot}' matched "
-            f"{num_robot_joints} joints. Extra joint columns will be ignored."
-        )
+    print(f"[INFO]: Replaying {len(robot.joint_names)} joints and {len(robot.body_names)} bodies by name.")
 
     # Simulation loop
-    while simulation_app.is_running():
+    while sim.is_headless_or_exist_active_visualizer():
         time_steps += 1
         reset_ids = time_steps >= motion.time_step_total
         time_steps[reset_ids] = 0
 
-        root_states = robot.data.default_root_state.clone()
-        root_states[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins[:, None, :]
-        root_states[:, 3:7] = motion.body_quat_w[time_steps][:, 0]
-        root_states[:, 7:10] = motion.body_lin_vel_w[time_steps][:, 0]
-        root_states[:, 10:] = motion.body_ang_vel_w[time_steps][:, 0]
+        root_pose = robot.data.default_root_pose.torch.clone()
+        root_pose[:, :3] = motion.body_pos_w[time_steps][:, 0] + scene.env_origins
+        root_pose[:, 3:7] = motion.body_quat_w[time_steps][:, 0]
+        root_velocity = robot.data.default_root_vel.torch.clone()
+        root_velocity[:, :3] = motion.body_lin_vel_w[time_steps][:, 0]
+        root_velocity[:, 3:] = motion.body_ang_vel_w[time_steps][:, 0]
 
-        joint_pos = robot.data.default_joint_pos.clone()
-        joint_vel = robot.data.default_joint_vel.clone()
-        joint_pos[:, robot_joint_indexes] = motion.joint_pos[time_steps][:, :num_robot_joints]
-        joint_vel[:, robot_joint_indexes] = motion.joint_vel[time_steps][:, :num_robot_joints]
+        joint_pos = robot.data.default_joint_pos.torch.clone()
+        joint_vel = robot.data.default_joint_vel.torch.clone()
+        joint_pos[:] = motion.joint_pos[time_steps]
+        joint_vel[:] = motion.joint_vel[time_steps]
 
-        robot.write_root_state_to_sim(root_states)
-        robot.write_joint_state_to_sim(joint_pos, joint_vel)
+        robot.write_root_pose_to_sim_index(root_pose=root_pose)
+        robot.write_root_velocity_to_sim_index(root_velocity=root_velocity)
+        robot.write_joint_state_to_sim_index(position=joint_pos, velocity=joint_vel)
         scene.write_data_to_sim()
         sim.render()  # We don't want physic (sim.step())
         scene.update(sim_dt)
 
-        pos_lookat = root_states[0, :3].cpu().numpy()
+        pos_lookat = root_pose[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
 
 
 def main():
-    sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
-    sim_cfg.dt = 0.02
-    sim = SimulationContext(sim_cfg)
+    with launch_simulation(cfg=PhysicsCfg(), launcher_args=args_cli) as physics_cfg:
+        sim_cfg = sim_utils.SimulationCfg(device=args_cli.device, dt=0.02, physics=physics_cfg)
+        sim = SimulationContext(sim_cfg)
 
-    scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)
-    scene = InteractiveScene(scene_cfg)
-    sim.reset()
-    # Run the simulator
-    run_simulator(sim, scene)
+        scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)
+        scene = InteractiveScene(scene_cfg)
+        sim.reset()
+        run_simulator(sim, scene)
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
-    simulation_app.close()

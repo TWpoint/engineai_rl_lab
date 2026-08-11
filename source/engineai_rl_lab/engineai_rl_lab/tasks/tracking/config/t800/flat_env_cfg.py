@@ -1,7 +1,7 @@
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 
-from engineai_rl_lab.tasks.tracking.robots.t800 import T800_ACTION_SCALE, T800_CYLINDER_CFG
 from engineai_rl_lab.tasks.tracking.config.t800.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
+from engineai_rl_lab.tasks.tracking.robots.t800 import T800_ACTION_SCALE, T800_CYLINDER_CFG
 from engineai_rl_lab.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
 
 

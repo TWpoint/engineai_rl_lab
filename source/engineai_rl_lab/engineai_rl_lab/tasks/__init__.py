@@ -9,9 +9,14 @@
 # Register Gym environments.
 ##
 
+import builtins
+
 from isaaclab_tasks.utils import import_packages
 
-# The blacklist is used to prevent importing configs from sub-packages
-_BLACKLIST_PKGS = ["utils", ".mdp"]
-# Import all configs in this package
-import_packages(__name__, _BLACKLIST_PKGS)
+# Isaac Lab's app launcher may temporarily evict packages containing "lab" from
+# sys.modules while Kit starts. Keep registration idempotent across that re-import.
+if not getattr(builtins, "_engineai_rl_lab_tasks_registered", False):
+    # The blacklist is used to prevent importing configs from sub-packages.
+    _BLACKLIST_PKGS = ["utils", ".mdp"]
+    import_packages(__name__, _BLACKLIST_PKGS)
+    builtins._engineai_rl_lab_tasks_registered = True

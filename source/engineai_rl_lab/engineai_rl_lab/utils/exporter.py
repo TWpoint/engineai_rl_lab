@@ -6,13 +6,14 @@
 # import numpy as np
 import os
 
+import onnx
+
 # import re
 import torch
 import yaml
 
-import onnx
-
 from isaaclab.envs import ManagerBasedRLEnv
+
 from isaaclab_rl.rsl_rl.exporter import _OnnxPolicyExporter
 
 # from numbers import Number
@@ -146,12 +147,14 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
 def list_to_csv_str(arr, *, decimals: int = 3, delimiter: str = ",") -> str:
     fmt = f"{{:.{decimals}f}}"
     return delimiter.join(
-        fmt.format(x) if isinstance(x, (int, float)) else str(x) for x in arr  # numbers → format, strings → as-is
+        fmt.format(x) if isinstance(x, (int, float)) else str(x)
+        for x in arr  # numbers → format, strings → as-is
     )
 
 
 def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filename="policy.onnx") -> None:
     onnx_path = os.path.join(path, filename)
+    robot = env.scene["robot"]
 
     observation_names = env.observation_manager.active_terms["policy"]
     observation_history_lengths: list[int] = []
@@ -164,20 +167,28 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
             history_length = term_cfg["history_length"]
             observation_history_lengths.append(1 if history_length == 0 else history_length)
 
+    default_joint_pos_nominal = getattr(robot.data, "default_joint_pos_nominal", None)
+    if default_joint_pos_nominal is None:
+        default_joint_pos_nominal = robot.data.default_joint_pos.torch[0]
+
+    action_scale = env.action_manager.get_term("joint_pos")._scale
+    if isinstance(action_scale, torch.Tensor):
+        if action_scale.ndim > 1:
+            action_scale = action_scale[0]
+        action_scale = action_scale.cpu().tolist()
+    else:
+        action_scale = [float(action_scale)] * len(robot.joint_names)
+
     metadata = {
         # "run_path": run_path,
-        "default_joint_pos": (
-            getattr(env.scene["robot"].data, "default_joint_pos_nominal", env.scene["robot"].data.default_joint_pos[0])
-            .cpu()
-            .tolist()
-        ),
-        "joint_names": env.scene["robot"].data.joint_names,
-        "joint_stiffness": env.scene["robot"].data.default_joint_stiffness[0].cpu().tolist(),
-        "joint_damping": env.scene["robot"].data.default_joint_damping[0].cpu().tolist(),
+        "default_joint_pos": default_joint_pos_nominal.cpu().tolist(),
+        "joint_names": robot.joint_names,
+        "joint_stiffness": robot.data.joint_stiffness.torch[0].cpu().tolist(),
+        "joint_damping": robot.data.joint_damping.torch[0].cpu().tolist(),
         # "command_names": env.command_manager.active_terms,
         "observation_names": observation_names,
         "observation_history_lengths": observation_history_lengths,
-        "action_scale": env.action_manager.get_term("joint_pos")._scale[0].cpu().tolist(),
+        "action_scale": action_scale,
         # "anchor_body_name": env.command_manager.get_term("motion").cfg.anchor_body_name,
         # "body_names": env.command_manager.get_term("motion").cfg.body_names,
     }

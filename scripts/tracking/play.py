@@ -1,12 +1,19 @@
 """Script to play a checkpoint if an RL agent from RSL-RL."""
 
-"""Launch Isaac Sim Simulator first."""
-
 import argparse
+import importlib.metadata as metadata
 import importlib.util
+import os
+import pathlib
+import subprocess
 import sys
 
-from isaaclab.app import AppLauncher
+# Register the downstream tasks before preset-aware argument parsing so --help can enumerate their variants.
+import engineai_rl_lab.tasks  # noqa: F401, E402
+
+from isaaclab.app import add_launcher_args
+
+from isaaclab_tasks.utils import setup_preset_cli
 
 # local imports
 import cli_args as cli_args  # isort: skip
@@ -23,9 +30,9 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
-args_cli, hydra_args = parser.parse_known_args()
+# append simulation launcher and backend-preset arguments
+add_launcher_args(parser)
+args_cli, hydra_args = setup_preset_cli(parser, agent_library="rsl_rl")
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -33,20 +40,16 @@ if args_cli.video:
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-"""Rest everything follows."""
-
 import gymnasium as gym
-import os
-import pathlib
 import torch
-import subprocess
-
+from engineai_rl_lab.utils.exporter import (
+    attach_onnx_metadata,
+    export_motion_policy_as_onnx,
+    get_actor_obs_normalizer,
+)
 from rsl_rl.runners import OnPolicyRunner
 
+from isaaclab.app import launch_simulation
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,
@@ -54,18 +57,12 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
-from isaaclab.utils.dict import print_dict
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+
+from isaaclab_rl.entrypoints.common import apply_video_recording, pre_launch_video_config
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-
-# Import extensions to set up environment tasks
-import engineai_rl_lab.tasks  # noqa: F401
-from engineai_rl_lab.utils.exporter import (
-    attach_onnx_metadata,
-    export_motion_policy_as_onnx,
-    get_actor_obs_normalizer,
-)
 
 
 def sanitize_rsl_rl_cfg(cfg: dict) -> dict:
@@ -78,11 +75,16 @@ def sanitize_rsl_rl_cfg(cfg: dict) -> dict:
     return cfg
 
 
-@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point", play_mode=True)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
-    agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    env_cfg.sim.use_fabric = not args_cli.disable_fabric
+
+    installed_rsl_rl_version = metadata.version("rsl-rl-lib")
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_rsl_rl_version)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -130,102 +132,91 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
             env_cfg.commands.motion.motion_file = os.path.abspath(args_cli.motion_file)
 
-    # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
     log_dir = os.path.dirname(resume_path)
 
-    # wrap for video recording
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+    pre_launch_video_config(env_cfg, args_cli=args_cli)
+    with launch_simulation(env_cfg, args_cli):
+        env_cfg.log_dir = log_dir
+        apply_video_recording(env_cfg, log_dir, args_cli, subdir="play")
+        # create isaac environment after the requested physics backend has been launched
+        env = gym.make(args_cli.task, cfg=env_cfg)
 
-    # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+        # convert to single-agent instance if required by the RL algorithm
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
 
-    # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env)
+        # wrap around environment for rsl-rl
+        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    # load previously trained model
-    ppo_runner = OnPolicyRunner(env, sanitize_rsl_rl_cfg(agent_cfg.to_dict()), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+        # load previously trained model
+        ppo_runner = OnPolicyRunner(
+            env, sanitize_rsl_rl_cfg(agent_cfg.to_dict()), log_dir=None, device=agent_cfg.device
+        )
+        ppo_runner.load(resume_path)
 
-    # obtain the trained policy for inference
-    policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+        # obtain the trained policy for inference
+        policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        # export policy to ONNX
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
-    export_motion_policy_as_onnx(
-        env.unwrapped,
-        ppo_runner.alg.get_policy(),
-        normalizer=get_actor_obs_normalizer(ppo_runner),
-        path=export_model_dir,
-        filename="policy.onnx",
-    )
-    # 导出后立即转换为MNN
-    onnx_file = os.path.join(export_model_dir, "policy.onnx")
-    mnn_file = os.path.join(export_model_dir, "policy.mnn")
+        export_motion_policy_as_onnx(
+            env.unwrapped,
+            ppo_runner.alg.get_policy(),
+            normalizer=get_actor_obs_normalizer(ppo_runner),
+            path=export_model_dir,
+            filename="policy.onnx",
+        )
+        # Convert the exported policy to MNN when the optional converter is installed.
+        onnx_file = os.path.join(export_model_dir, "policy.onnx")
+        mnn_file = os.path.join(export_model_dir, "policy.mnn")
 
-    if os.path.exists(onnx_file):
-        if importlib.util.find_spec("MNN") is None:
-            print("[WARN] MNN is not installed in the current Python environment. Skipping MNN conversion.")
+        if os.path.exists(onnx_file):
+            if importlib.util.find_spec("MNN") is None:
+                print("[WARN] MNN is not installed in the current Python environment. Skipping MNN conversion.")
+            else:
+                try:
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "MNN.tools.mnnconvert",
+                            "-f",
+                            "ONNX",
+                            "--modelFile",
+                            onnx_file,
+                            "--MNNModel",
+                            mnn_file,
+                            "--bizCode",
+                            "MNN",
+                        ],
+                        check=True,
+                    )
+                    print(f"Successfully converted to MNN: {mnn_file}")
+                except subprocess.CalledProcessError as err:
+                    print(f"[WARN] Failed to convert ONNX to MNN: {err}")
         else:
-            try:
-                subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "MNN.tools.mnnconvert",
-                        "-f",
-                        "ONNX",
-                        "--modelFile",
-                        onnx_file,
-                        "--MNNModel",
-                        mnn_file,
-                        "--bizCode",
-                        "MNN",
-                    ],
-                    check=True,
-                )
-                print(f"Successfully converted to MNN: {mnn_file}")
-            except subprocess.CalledProcessError as err:
-                print(f"[WARN] Failed to convert ONNX to MNN: {err}")
-    else:
-        print(f"ONNX file not found: {onnx_file}")
+            print(f"ONNX file not found: {onnx_file}")
 
-    attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
-    # reset environment
-    obs = env.get_observations()
-    timestep = 0
-    # simulate environment
-    while simulation_app.is_running():
-        # run everything in inference mode
-        with torch.inference_mode():
-            # agent stepping
-            actions = policy(obs)
-            # env stepping
-            obs, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+        attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
+        obs = env.get_observations()
+        timestep = 0
+        try:
+            while env.unwrapped.sim.is_headless_or_exist_active_visualizer():
+                with torch.inference_mode():
+                    actions = policy(obs)
+                    obs, _, dones, _ = env.step(actions)
+                    if hasattr(policy, "reset"):
+                        policy.reset(dones)
+                if args_cli.video:
+                    timestep += 1
+                    if timestep >= args_cli.video_length:
+                        break
+        except KeyboardInterrupt:
+            pass
 
-    # close the simulator
-    env.close()
+        env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
-    simulation_app.close()

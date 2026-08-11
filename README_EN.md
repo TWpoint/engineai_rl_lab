@@ -1,6 +1,7 @@
 # engineai_rl_lab
-[![IsaacSim](https://img.shields.io/badge/IsaacSim-5.1.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
-[![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.3.2-silver)](https://isaac-sim.github.io/IsaacLab)
+[![Isaac Lab](https://img.shields.io/badge/IsaacLab-3.0_beta2+-silver)](https://github.com/isaac-sim/IsaacLab/releases)
+[![Newton](https://img.shields.io/badge/Physics-Newton_MJWarp-blue)](https://github.com/newton-physics/newton)
+[![Isaac Sim](https://img.shields.io/badge/Optional-Isaac_Sim_6.0.1-silver)](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/overview/index.html)
 
 [中文](README.md)
 
@@ -13,43 +14,115 @@ This project provides a set of reinforcement learning environments based on Isaa
 |**T800**|<img src="./docs/train.gif" height="180"/>|<img src="./docs/sim2sim.gif" height="180"/>|<img src="./docs/deploy.gif" height="180"/>|
 |**PM01**|<img src="./docs/train_pm.gif" height="180"/>|<img src="./docs/sim2sim_pm.gif" height="180"/>|<img src="./docs/deploy_pm.gif" height="180"/>|
 
+## Compatibility
+
+The current code targets Isaac Lab 3.0. The migration and validation baseline is commit `891116e68dac3d417cb5de2d722d16d44ae3f06d` on `develop`, using the multi-physics backend and preset CLI introduced in Isaac Lab 3.0 Beta 2. Because 3.0 is still evolving, review the official [release notes](https://github.com/isaac-sim/IsaacLab/releases) and [migration guide](https://isaac-sim.github.io/IsaacLab/develop/source/migration/migrating_to_isaaclab_3-0.html) before updating Isaac Lab.
+
+- Newton MJWarp runs without Isaac Sim; select it with `physics=newton_mjwarp`.
+- Isaac Sim PhysX/Kit is optional and requires Isaac Sim 6.0.1; select it with `physics=isaacsim_physx --viz kit`.
+- Isaac Lab 3.0 requires Python 3.12 and changes quaternion ordering to XYZW and asset data to Warp-backed arrays.
+- MJWarp in the current baseline does not enforce actuator `velocity_limit`/`velocity_limit_sim`. Do not treat those fields as training or real-robot safety limits; keep policy-side clipping and deployment safety checks.
+- Keep `SimulationCfg.use_newton_actuators=False` (the current configuration pins it explicitly); the Newton-native actuator path would otherwise bypass T800's Python delay actuator.
+
 ## Installation
-### Install Isaac Lab
-This repository is developed based on Isaac Lab 2.3.2, commit `c22775241e28f465fe345fa1a482ad6d29d712b0`. Code may not be compatible across different Isaac Lab versions. For detailed Isaac Lab installation steps, please refer to the official [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
+
+### Prepare Git LFS
+
+The robot USD assets and example checkpoints are managed by Git LFS. Install and initialize Git LFS before fetching the repository; otherwise, the USD files remain roughly 130-byte text pointers and the simulator cannot load the robots. On Ubuntu, run:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git-lfs
+git lfs install
+```
+
+First set the workspace directory that contains `IsaacLab` and this repository. On the current machine, use
+`export ENGINEAI_WORKSPACE=/home/ubuntu/engineai-newton`; replace the example path elsewhere:
+
+```bash
+export ENGINEAI_WORKSPACE=/path/to/your/workspace
+cd "$ENGINEAI_WORKSPACE"
+```
+
+If the repository already exists, fetch its LFS objects:
+
+```bash
+git -C engineai_rl_lab lfs pull
+```
+
+For a fresh workspace, clone only after `git lfs install`:
+
+```bash
+cd "$ENGINEAI_WORKSPACE"
+git clone https://github.com/engineai-robotics/engineai_rl_lab.git
+git -C engineai_rl_lab lfs pull
+```
+
+### Install Isaac Lab 3.0 and Newton
+
+The commands below assume that `IsaacLab`, the Python 3.12 virtual environment named `engineai-newton`, and this
+repository are all direct children of `$ENGINEAI_WORKSPACE`:
+
+```bash
+cd "$ENGINEAI_WORKSPACE"
+source "$ENGINEAI_WORKSPACE/engineai-newton/bin/activate"
+
+cd IsaacLab
+./isaaclab.sh -i 'newton,rl[rsl-rl],visualizer[newton]'
+```
+
+This installs Newton, RSL-RL, and the Newton visualizer without installing Isaac Sim. To also use PhysX/Kit, run:
+
+```bash
+./isaaclab.sh -i 'isaacsim,newton,rl[rsl-rl],visualizer[kit]'
+```
+
+For a fresh environment, follow the official Python 3.12 environment and `./isaaclab.sh -i` workflow in the [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html).
 
 ### Install engineai_rl_lab
-1. Clone engineai_rl_lab from GitHub:
+
+After `isaaclab.sh` finishes, the current directory is still `IsaacLab`. Use the workspace variable to return to this repository, then install it in the same activated environment:
+
 ```bash
-git clone https://github.com/engineai-robotics/engineai_rl_lab.git
+cd "$ENGINEAI_WORKSPACE/engineai_rl_lab"
+python -m pip install -e source/engineai_rl_lab
+python -m pip check
+python -c "import isaaclab, isaaclab_newton, newton, warp, rsl_rl, engineai_rl_lab; print('environment ready')"
 ```
 
-2. Install engineai_rl_lab:
-```bash
-# Make sure the Isaac Lab environment has been activated.
-cd engineai_rl_lab
-pip install -e source/engineai_rl_lab
-```
+An editable `isaaclab` package alone does not prove that the environment is complete. The import check also verifies that Newton, its Warp-backed runtime, and RSL-RL are actually installed.
 
 ## Training
 ### Whole-Body Tracking
+
+Run every command below from `$ENGINEAI_WORKSPACE/engineai_rl_lab` with the environment above still activated. All four scripts use Isaac Sim PhysX when their physics selector is omitted, so keep the selector shown below for Newton. The selector syntax intentionally differs by entry point:
+
+- `train.py` / `play.py` use the Hydra preset token `physics=newton_mjwarp`, without a leading `--`.
+- `csv_to_npz.py` / `replay_npz.py` use the argparse option `--physics newton_mjwarp`.
+
 1. Convert CSV files to NPZ files:
 ```bash
-# Convert CSV files to NPZ files. The generated NPZ files are saved in the same directory.
-python scripts/csv_to_npz.py --robot pm01 --input_fps 30 -f datasets/tracking/pm01/dance.csv
-python scripts/csv_to_npz.py --robot t800 --input_fps 30 -f datasets/tracking/t800/dance_t800.csv
+# The bundled CSV files use XYZW; declare the input order explicitly. Output NPZ files always use Isaac Lab 3.0 XYZW.
+python scripts/csv_to_npz.py --robot pm01 --input_fps 30 --input_quaternion_order xyzw -f datasets/tracking/pm01/dance.csv --physics newton_mjwarp
+python scripts/csv_to_npz.py --robot t800 --input_fps 30 --input_quaternion_order xyzw -f datasets/tracking/t800/dance_t800.csv --physics newton_mjwarp
 
-# Replay NPZ files.
-python scripts/replay_npz.py --robot pm01 --input_file datasets/tracking/pm01/dance.npz
-python scripts/replay_npz.py --robot t800 --input_file datasets/tracking/t800/dance_t800.npz
+# For an external CSV whose columns 4–7 use WXYZ, run:
+python scripts/csv_to_npz.py --robot pm01 --input_fps 30 --input_quaternion_order wxyz -f path/to/motion.csv --physics newton_mjwarp
+
+# Replay NPZ files with the Newton visualizer.
+python scripts/replay_npz.py --robot pm01 --input_file datasets/tracking/pm01/dance.npz --physics newton_mjwarp --viz newton_gl
+python scripts/replay_npz.py --robot t800 --input_file datasets/tracking/t800/dance_t800.npz --physics newton_mjwarp --viz newton_gl
 ```
+
+The converter accepts `--input_quaternion_order {xyzw,wxyz}` and normalizes both formats to XYZW. The legacy NPZ files shipped in this repository do not contain `quaternion_order` or `body_names`; the loader treats their quaternions as legacy WXYZ data and converts them to XYZW automatically. Body mapping falls back to the fixed PhysX ordering in the robot configuration. Do not rewrite those binary files in bulk.
 
 2. Train:
 ```bash
 # PM01
-python scripts/tracking/train.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --headless --num_envs 4096 --motion_file datasets/tracking/pm01/dance.npz
+python scripts/tracking/train.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --num_envs 4096 --motion_file datasets/tracking/pm01/dance.npz physics=newton_mjwarp
 
 # T800
-python scripts/tracking/train.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --headless --num_envs 4096 --motion_file datasets/tracking/t800/dance_t800.npz
+python scripts/tracking/train.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --num_envs 4096 --motion_file datasets/tracking/t800/dance_t800.npz physics=newton_mjwarp
 
 # View training logs.
 python -m tensorboard.main --logdir logs
@@ -58,11 +131,13 @@ python -m tensorboard.main --logdir logs
 3. Evaluate the trained policy and export it:
 ```bash
 # PM01
-python scripts/tracking/play.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/pm01/dance.npz --load_run 2026-06-23_09-58-43 --checkpoint dance.pt
+python scripts/tracking/play.py --task Tracking-Flat-PM01-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/pm01/dance.npz --load_run 2026-06-23_09-58-43 --checkpoint dance.pt physics=newton_mjwarp --viz newton_gl
 
 # T800
-python scripts/tracking/play.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/t800/dance_t800.npz --load_run 2026-06-28_20-47-15 --checkpoint dance.pt
+python scripts/tracking/play.py --task Tracking-Flat-T800-Wo-State-Estimation-v0 --num_envs 1 --motion_file datasets/tracking/t800/dance_t800.npz --load_run 2026-06-28_20-47-15 --checkpoint dance.pt physics=newton_mjwarp --viz newton_gl
 ```
+
+`--viz newton_gl` opens the Newton GL visualizer. The current project config launches no visualizer when `--viz` is omitted; `--viz none` explicitly disables every visualizer. This baseline removed `--headless` and `--enable_cameras` from the command-line parser, so do not pass those legacy flags. Use the `HEADLESS=1` environment variable only when Kit itself must run without a host window; visualizer selection is still controlled by `--viz`. Run `python scripts/tracking/train.py --task <TASK_ID> --help` to list the physics presets declared by a task.
 
 ## Deployment
 ### Install engineai_robotics_native_sdk

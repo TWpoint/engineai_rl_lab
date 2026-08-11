@@ -1,8 +1,54 @@
-import isaaclab.sim as sim_utils
-from isaaclab.assets.articulation import ArticulationCfg
-from isaaclab.utils import configclass
+from importlib.util import find_spec
+from pathlib import Path
 
 from engineai_rl_lab.tasks.tracking.robots.actuator import DelayedImplicitActuatorCfg
+
+import isaaclab.sim as sim_utils
+from isaaclab.assets import apply_articulation_ordering_preset
+from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.utils.configclass import configclass
+
+_ASSET_DIR = Path(__file__).resolve().parents[3] / "assets"
+
+
+def _rigid_body_properties():
+    """Build available backend fragments without requiring PhysX in kit-less Newton installs."""
+    if find_spec("isaaclab_physx") is None:
+        return None
+    from isaaclab_physx.sim.schemas import PhysxRigidBodyCfg
+
+    return [
+        PhysxRigidBodyCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        )
+    ]
+
+
+def _articulation_properties():
+    """Author self-collision settings for every installed physics backend."""
+    properties = []
+    if find_spec("isaaclab_physx") is not None:
+        from isaaclab_physx.sim.schemas import PhysxArticulationCfg
+
+        properties.append(
+            PhysxArticulationCfg(
+                enabled_self_collisions=False,
+                solver_position_iteration_count=8,
+                solver_velocity_iteration_count=4,
+            )
+        )
+    if find_spec("isaaclab_newton") is not None:
+        from isaaclab_newton.sim.schemas import NewtonArticulationCfg
+
+        properties.append(NewtonArticulationCfg(self_collision_enabled=False))
+    return properties or None
+
 
 EFFORT_LIMIT_Q300HL = 415  # hip pitch, knee pitch
 EFFORT_LIMIT_Q300H = 370  # hip roll
@@ -61,20 +107,10 @@ class RobotArticulationCfg(ArticulationCfg):
 
 T800_CYLINDER_CFG = RobotArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path="source/engineai_rl_lab/engineai_rl_lab/assets/t800/serial_t800.usd",
+        usd_path=str(_ASSET_DIR / "t800" / "serial_t800.usd"),
         activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            retain_accelerations=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
-            max_linear_velocity=1000.0,
-            max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
-        ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True, solver_position_iteration_count=8, solver_velocity_iteration_count=4
-        ),        
+        rigid_props=_rigid_body_properties(),
+        articulation_props=_articulation_properties(),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 1.06),
@@ -232,6 +268,7 @@ T800_CYLINDER_CFG = RobotArticulationCfg(
         "J24_HEAD_YAW",
     ],
 )
+T800_CYLINDER_CFG = apply_articulation_ordering_preset(T800_CYLINDER_CFG, "physx")
 
 T800_ACTION_SCALE: dict[str, float] = {
     "J00_HIP_PITCH_L": 0.5,

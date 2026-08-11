@@ -5,7 +5,7 @@
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py312"
 
 # Exclude directories
 extend-exclude = [
@@ -89,7 +89,7 @@ section-order = [
     "curobo",
 ]
 
-"isaaclab" = ["isaaclab"]
+"isaaclab" = ["isaaclab", "isaaclab_newton", "isaaclab_ovphysx", "isaaclab_physx"]
 "isaaclab-assets" = ["isaaclab_assets"]
 "isaaclab-contrib" = ["isaaclab_contrib"]
 "isaaclab-rl" = ["isaaclab_rl"]
@@ -113,7 +113,7 @@ exclude = [
 ]
 
 typeCheckingMode = "basic"
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 pythonPlatform = "Linux"
 enableTypeIgnoreComments = true
 

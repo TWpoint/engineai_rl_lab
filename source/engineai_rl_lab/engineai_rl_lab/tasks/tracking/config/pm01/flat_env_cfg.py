@@ -1,7 +1,7 @@
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 
-from engineai_rl_lab.tasks.tracking.robots.pm01 import PM01_ACTION_SCALE, PM01_CYLINDER_CFG
 from engineai_rl_lab.tasks.tracking.config.pm01.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
+from engineai_rl_lab.tasks.tracking.robots.pm01 import PM01_ACTION_SCALE, PM01_CYLINDER_CFG
 from engineai_rl_lab.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
 
 
@@ -46,6 +46,7 @@ class PM01FlatWoStateEstimationEnvCfg(PM01FlatEnvCfg):
         super().__post_init__()
         self.observations.policy.motion_anchor_pos_b = None
         self.observations.policy.base_lin_vel = None
+
 
 @configclass
 class PM01FlatLowFreqEnvCfg(PM01FlatEnvCfg):

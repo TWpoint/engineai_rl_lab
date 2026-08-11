@@ -2,18 +2,22 @@
 
 .. code-block:: bash
 
-    python scripts/tracking/csv_to_npz.py --robot pm01 --input_fps 30 -f <path_to_input.csv> 
-    python scripts/tracking/csv_to_npz.py --robot t800 --input_fps 30 -f <path_to_input.csv> 
+    python scripts/csv_to_npz.py --robot pm01 --input_fps 30 -f <path_to_input.csv>
+    python scripts/csv_to_npz.py --robot t800 --input_fps 30 -f <path_to_input.csv>
+    python scripts/csv_to_npz.py --robot pm01 --input_quaternion_order wxyz -f <legacy_motion.csv>
+
+The CSV columns are ``root_x, root_y, root_z, quaternion, joint_positions``.
+Input quaternions can be XYZW or WXYZ; output NPZ files always use Isaac Lab 3.x XYZW.
 """
 
-"""Launch Isaac Sim Simulator first."""
+"""Parse CLI arguments before selecting an Isaac Lab physics backend."""
 
 import argparse
 import os
 
 import numpy as np
 
-from isaaclab.app import AppLauncher
+from isaaclab.app import add_launcher_args, launch_simulation
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay motion from csv file and output to npz file.")
@@ -27,6 +31,15 @@ parser.add_argument(
 parser.add_argument("--input_file", "-f", type=str, required=True, help="The path to the input motion csv file.")
 parser.add_argument("--input_fps", type=int, default=30, help="The fps of the input motion.")
 parser.add_argument(
+    "--input_quaternion_order",
+    choices=["xyzw", "wxyz"],
+    default="xyzw",
+    help=(
+        "Quaternion component order in columns 4-7 of the input CSV. Defaults to 'xyzw', which matches the CSV "
+        "files shipped with this repository. Values are converted internally to Isaac Lab 3.x XYZW."
+    ),
+)
+parser.add_argument(
     "--frame_range",
     nargs=2,
     type=int,
@@ -38,9 +51,15 @@ parser.add_argument(
 )
 parser.add_argument("--output_name", type=str, help="The name of the motion npz file.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
+parser.add_argument(
+    "--physics",
+    default="isaacsim_physx",
+    choices=["isaacsim_physx", "newton_mjwarp"],
+    help="Physics backend used to load and replay the robot.",
+)
 
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
+# append simulation launcher cli args
+add_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 if not args_cli.output_name:
@@ -48,21 +67,7 @@ if not args_cli.output_name:
     args_cli.output_name = os.path.splitext(args_cli.input_file)[0] + ".npz"
 
 
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
-
-"""Rest everything follows."""
-
 import torch
-
-import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
-from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
-from isaaclab.sim import SimulationContext
-from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, quat_slerp
 
 ##
 # Pre-defined configs
@@ -70,10 +75,35 @@ from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, 
 from engineai_rl_lab.tasks.tracking.robots.pm01 import PM01_CYLINDER_CFG
 from engineai_rl_lab.tasks.tracking.robots.t800 import T800_CYLINDER_CFG
 
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.physics import PhysicsCfg
+from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.sim import SimulationContext
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.configclass import configclass
+from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, quat_slerp
+
 ROBOT_CFGS = {
     "pm01": PM01_CYLINDER_CFG,
     "t800": T800_CYLINDER_CFG,
 }
+
+
+def quaternion_to_xyzw(quaternions: torch.Tensor, input_order: str) -> torch.Tensor:
+    """Return quaternions in Isaac Lab 3.x XYZW order.
+
+    Args:
+        quaternions: Tensor whose final dimension contains four quaternion components.
+        input_order: Component order in ``quaternions``; either ``"xyzw"`` or ``"wxyz"``.
+    """
+    if quaternions.shape[-1] != 4:
+        raise ValueError(f"Expected quaternions with four components, received shape {tuple(quaternions.shape)}.")
+    if input_order == "xyzw":
+        return quaternions
+    if input_order == "wxyz":
+        return torch.roll(quaternions, shifts=-1, dims=-1)
+    raise ValueError(f"Unsupported input quaternion order {input_order!r}; expected 'xyzw' or 'wxyz'.")
 
 
 @configclass
@@ -104,6 +134,7 @@ class MotionLoader:
         output_fps: int,
         device: torch.device,
         frame_range: tuple[int, int] | None,
+        input_quaternion_order: str = "xyzw",
     ):
         self.motion_file = motion_file
         self.input_fps = input_fps
@@ -113,6 +144,7 @@ class MotionLoader:
         self.current_idx = 0
         self.device = device
         self.frame_range = frame_range
+        self.input_quaternion_order = input_quaternion_order
         self._load_motion()
         self._interpolate_motion()
         self._compute_velocities()
@@ -132,8 +164,7 @@ class MotionLoader:
             )
         motion = motion.to(torch.float32).to(self.device)
         self.motion_base_poss_input = motion[:, :3]
-        self.motion_base_rots_input = motion[:, 3:7]
-        self.motion_base_rots_input = self.motion_base_rots_input[:, [3, 0, 1, 2]]  # convert to wxyz
+        self.motion_base_rots_input = quaternion_to_xyzw(motion[:, 3:7], self.input_quaternion_order)
         self.motion_dof_poss_input = motion[:, 7:]
 
         self.input_frames = motion.shape[0]
@@ -180,7 +211,7 @@ class MotionLoader:
         """Computes the frame blend for the motion."""
         phase = times / self.duration
         index_0 = (phase * (self.input_frames - 1)).floor().long()
-        index_1 = torch.minimum(index_0 + 1, torch.tensor(self.input_frames - 1))
+        index_1 = torch.minimum(index_0 + 1, torch.tensor(self.input_frames - 1, device=self.device))
         blend = phase * (self.input_frames - 1) - index_0
         return index_0, index_1, blend
 
@@ -199,6 +230,13 @@ class MotionLoader:
         Returns:
             shape (B, 3).
         """
+        if rotations.shape[0] == 1:
+            return torch.zeros((1, 3), dtype=rotations.dtype, device=rotations.device)
+        if rotations.shape[0] == 2:
+            q_rel = quat_mul(rotations[1:], quat_conjugate(rotations[:-1]))
+            omega = axis_angle_from_quat(q_rel) / dt
+            return torch.cat([omega, omega], dim=0)
+
         q_prev, q_next = rotations[:-2], rotations[2:]
         q_rel = quat_mul(q_next, quat_conjugate(q_prev))  # shape (B-2, 4)
 
@@ -242,6 +280,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         output_fps=args_cli.output_fps,
         device=sim.device,
         frame_range=args_cli.frame_range,
+        input_quaternion_order=args_cli.input_quaternion_order,
     )
 
     # Extract scene entities
@@ -258,12 +297,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         "body_lin_vel_w": [],
         "body_ang_vel_w": [],
         "joint_names": robot.joint_names,
+        "body_names": robot.body_names,
+        "quaternion_order": "xyzw",
     }
     file_saved = False
     # --------------------------------------------------------------------------
 
     # Simulation loop
-    while simulation_app.is_running():
+    while sim.is_headless_or_exist_active_visualizer():
         (
             (
                 motion_base_pos,
@@ -277,33 +318,35 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         ) = motion.get_next_state()
 
         # set root state
-        root_states = robot.data.default_root_state.clone()
-        root_states[:, :3] = motion_base_pos
-        root_states[:, :2] += scene.env_origins[:, :2]
-        root_states[:, 3:7] = motion_base_rot
-        root_states[:, 7:10] = motion_base_lin_vel
-        root_states[:, 10:] = motion_base_ang_vel
-        robot.write_root_state_to_sim(root_states)
+        root_pose = robot.data.default_root_pose.torch.clone()
+        root_pose[:, :3] = motion_base_pos
+        root_pose[:, :2] += scene.env_origins[:, :2]
+        root_pose[:, 3:7] = motion_base_rot
+        root_velocity = robot.data.default_root_vel.torch.clone()
+        root_velocity[:, :3] = motion_base_lin_vel
+        root_velocity[:, 3:] = motion_base_ang_vel
+        robot.write_root_pose_to_sim_index(root_pose=root_pose)
+        robot.write_root_velocity_to_sim_index(root_velocity=root_velocity)
 
         # set joint state
-        joint_pos = robot.data.default_joint_pos.clone()
-        joint_vel = robot.data.default_joint_vel.clone()
+        joint_pos = robot.data.default_joint_pos.torch.clone()
+        joint_vel = robot.data.default_joint_vel.torch.clone()
         joint_pos[:, robot_joint_indexes] = motion_dof_pos
         joint_vel[:, robot_joint_indexes] = motion_dof_vel
-        robot.write_joint_state_to_sim(joint_pos, joint_vel)
+        robot.write_joint_state_to_sim_index(position=joint_pos, velocity=joint_vel)
         sim.render()  # We don't want physic (sim.step())
         scene.update(sim.get_physics_dt())
 
-        pos_lookat = root_states[0, :3].cpu().numpy()
+        pos_lookat = root_pose[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
 
         if not file_saved:
-            log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
-            log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
-            log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
-            log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
-            log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
-            log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
+            log["joint_pos"].append(robot.data.joint_pos.torch[0, :].cpu().numpy().copy())
+            log["joint_vel"].append(robot.data.joint_vel.torch[0, :].cpu().numpy().copy())
+            log["body_pos_w"].append(robot.data.body_pos_w.torch[0, :].cpu().numpy().copy())
+            log["body_quat_w"].append(robot.data.body_quat_w.torch[0, :].cpu().numpy().copy())
+            log["body_lin_vel_w"].append(robot.data.body_lin_vel_w.torch[0, :].cpu().numpy().copy())
+            log["body_ang_vel_w"].append(robot.data.body_ang_vel_w.torch[0, :].cpu().numpy().copy())
 
         if reset_flag and not file_saved:
             file_saved = True
@@ -324,23 +367,19 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
 def main():
     """Main function."""
-    # Load kit helper
-    sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
-    sim_cfg.dt = 1.0 / args_cli.output_fps
-    sim = SimulationContext(sim_cfg)
-    # Design scene
-    scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)
-    scene = InteractiveScene(scene_cfg)
-    # Play the simulator
-    sim.reset()
-    # Now we are ready!
-    print("[INFO]: Setup complete...")
-    # Run the simulator
-    run_simulator(sim, scene)
+    with launch_simulation(cfg=PhysicsCfg(), launcher_args=args_cli) as physics_cfg:
+        sim_cfg = sim_utils.SimulationCfg(
+            device=args_cli.device,
+            dt=1.0 / args_cli.output_fps,
+            physics=physics_cfg,
+        )
+        sim = SimulationContext(sim_cfg)
+        scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)
+        scene = InteractiveScene(scene_cfg)
+        sim.reset()
+        print("[INFO]: Setup complete...")
+        run_simulator(sim, scene)
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
-    simulation_app.close()

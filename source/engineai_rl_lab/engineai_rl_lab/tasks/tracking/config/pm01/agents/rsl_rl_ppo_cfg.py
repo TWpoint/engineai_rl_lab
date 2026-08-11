@@ -1,4 +1,5 @@
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
+
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 
@@ -41,7 +42,7 @@ LOW_FREQ_SCALE = 0.5
 
 
 @configclass
-class G1FlatLowFreqPPORunnerCfg(PM01FlatPPORunnerCfg):
+class PM01FlatLowFreqPPORunnerCfg(PM01FlatPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.num_steps_per_env = round(self.num_steps_per_env * LOW_FREQ_SCALE)

@@ -1,4 +1,5 @@
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
+
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
 
@@ -7,7 +8,9 @@ class T800FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 20000
     save_interval = 2000
-    experiment_name = "tracking_t800"
+    logger = "wandb"
+    run_name = "baseline"
+    wandb_project = experiment_name = "tracking_t800"
     empirical_normalization = True
     obs_groups = {"actor": ["policy"], "critic": ["critic"]}
     actor = RslRlMLPModelCfg(

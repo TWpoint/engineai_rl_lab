@@ -4,7 +4,8 @@ import inspect
 import re
 
 import torch
-from isaaclab.utils import configclass
+
+from isaaclab.utils.configclass import configclass
 from isaaclab.utils.noise import UniformNoiseCfg
 
 

@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import math
-import numpy as np
 import os
-import torch
 from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
 from isaaclab.utils.math import (
     quat_apply,
     quat_error_magnitude,
@@ -28,19 +29,116 @@ if TYPE_CHECKING:
 
 
 class MotionLoader:
-    def __init__(self, motion_file: str, body_indexes: Sequence[int], device: str = "cpu"):
+    def __init__(
+        self,
+        motion_file: str,
+        body_indexes: Sequence[int],
+        device: str = "cpu",
+        *,
+        joint_names: Sequence[str] | None = None,
+        body_names: Sequence[str] | None = None,
+    ):
         assert os.path.isfile(motion_file), f"Invalid file path: {motion_file}"
-        data = np.load(motion_file)
-        self.fps = data["fps"]
-        self.joint_names = data["joint_names"].astype(str).tolist() if "joint_names" in data.files else None
-        self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
-        self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
-        self._body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
-        self._body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
-        self._body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
-        self._body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
-        self._body_indexes = body_indexes
+        with np.load(motion_file) as data:
+            self.fps = data["fps"]
+            file_joint_names = data["joint_names"].astype(str).tolist() if "joint_names" in data.files else None
+            file_body_names = data["body_names"].astype(str).tolist() if "body_names" in data.files else None
+            self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
+            self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
+            self._body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
+            self._body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
+            self._body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
+            self._body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
+
+            # Isaac Lab 3.x uses XYZW quaternions throughout. Motion files produced by the
+            # pre-3.0 conversion scripts did not carry format metadata and stored WXYZ.
+            quaternion_order = "wxyz"
+            if "quaternion_order" in data.files:
+                quaternion_order = np.asarray(data["quaternion_order"]).item()
+                if isinstance(quaternion_order, bytes):
+                    quaternion_order = quaternion_order.decode("ascii")
+                quaternion_order = str(quaternion_order).lower()
+
+        if self.joint_pos.shape != self.joint_vel.shape:
+            raise ValueError(
+                f"Motion file {motion_file!r} has mismatched joint_pos {tuple(self.joint_pos.shape)} and "
+                f"joint_vel {tuple(self.joint_vel.shape)} shapes."
+            )
+        body_shape = self._body_pos_w.shape[:2]
+        if any(
+            array.shape[:2] != body_shape
+            for array in (
+                self._body_quat_w,
+                self._body_lin_vel_w,
+                self._body_ang_vel_w,
+            )
+        ):
+            raise ValueError(f"Motion file {motion_file!r} has inconsistent body data axes.")
+        if self._body_quat_w.shape[-1] != 4:
+            raise ValueError(f"Motion file {motion_file!r} body_quat_w must have four quaternion components.")
+
+        if file_joint_names is not None and len(file_joint_names) != self.joint_pos.shape[1]:
+            raise ValueError(
+                f"Motion file {motion_file!r} has {len(file_joint_names)} joint_names entries but "
+                f"{self.joint_pos.shape[1]} joint samples."
+            )
+
+        joint_names = list(joint_names) if joint_names is not None else None
+        if joint_names is not None and file_joint_names is not None:
+            joint_indexes = self._resolve_name_indexes(file_joint_names, joint_names, "joint", require_complete=True)
+            self.joint_pos = self.joint_pos[:, joint_indexes]
+            self.joint_vel = self.joint_vel[:, joint_indexes]
+        elif joint_names is not None and self.joint_pos.shape[-1] != len(joint_names):
+            raise ValueError(
+                f"Motion file {motion_file!r} has {self.joint_pos.shape[-1]} joints but the robot has "
+                f"{len(joint_names)}. Add joint_names metadata so the axes can be mapped safely."
+            )
+        self.joint_names = joint_names if joint_names is not None else file_joint_names
+
+        if file_body_names is not None and len(file_body_names) != self._body_pos_w.shape[1]:
+            raise ValueError(
+                f"Motion file {motion_file!r} has {len(file_body_names)} body_names entries but "
+                f"{self._body_pos_w.shape[1]} body samples."
+            )
+
+        if body_names is not None and file_body_names is not None:
+            body_names = list(body_names)
+            resolved_body_indexes = self._resolve_name_indexes(
+                file_body_names, body_names, "body", require_complete=False
+            )
+            self._body_indexes = torch.tensor(resolved_body_indexes, dtype=torch.long, device=device)
+        else:
+            # Legacy files omitted body names and used the PhysX articulation-view
+            # order. Robot configs pin their public body order to that convention.
+            self._body_indexes = torch.as_tensor(body_indexes, dtype=torch.long, device=device)
+            if len(self._body_indexes) > 0 and int(self._body_indexes.max()) >= self._body_pos_w.shape[1]:
+                raise ValueError(
+                    f"Motion file {motion_file!r} has only {self._body_pos_w.shape[1]} bodies, but the "
+                    f"requested legacy body index reaches {int(self._body_indexes.max())}."
+                )
+
+        if quaternion_order == "wxyz":
+            self._body_quat_w = torch.roll(self._body_quat_w, shifts=-1, dims=-1)
+        elif quaternion_order != "xyzw":
+            raise ValueError(
+                f"Unsupported quaternion_order {quaternion_order!r} in motion file {motion_file!r}. "
+                "Expected 'wxyz' or 'xyzw'."
+            )
         self.time_step_total = self.joint_pos.shape[0]
+
+    @staticmethod
+    def _resolve_name_indexes(
+        file_names: Sequence[str], requested_names: Sequence[str], kind: str, *, require_complete: bool
+    ) -> list[int]:
+        if len(file_names) != len(set(file_names)):
+            raise ValueError(f"Motion file contains duplicate {kind} names: {file_names}.")
+        index_by_name = {name: index for index, name in enumerate(file_names)}
+        requested_name_set = set(requested_names)
+        missing = [name for name in requested_names if name not in index_by_name]
+        extra = [name for name in file_names if name not in requested_name_set] if require_complete else []
+        if missing or extra:
+            raise ValueError(f"Motion {kind} names do not match the robot. Missing={missing}, extra={extra}.")
+        return [index_by_name[name] for name in requested_names]
 
     @property
     def body_pos_w(self) -> torch.Tensor:
@@ -72,11 +170,17 @@ class MotionCommand(CommandTerm):
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
-        self.motion = MotionLoader(self.cfg.motion_file, self.body_indexes, device=self.device)
+        self.motion = MotionLoader(
+            self.cfg.motion_file,
+            self.body_indexes,
+            device=self.device,
+            joint_names=self.robot.joint_names,
+            body_names=self.cfg.body_names,
+        )
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
-        self.body_quat_relative_w[:, :, 0] = 1.0
+        self.body_quat_relative_w[:, :, 3] = 1.0
 
         self.bin_count = int(self.motion.time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1
         self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
@@ -144,43 +248,43 @@ class MotionCommand(CommandTerm):
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
-        return self.robot.data.joint_pos
+        return self.robot.data.joint_pos.torch
 
     @property
     def robot_joint_vel(self) -> torch.Tensor:
-        return self.robot.data.joint_vel
+        return self.robot.data.joint_vel.torch
 
     @property
     def robot_body_pos_w(self) -> torch.Tensor:
-        return self.robot.data.body_pos_w[:, self.body_indexes]
+        return self.robot.data.body_pos_w.torch[:, self.body_indexes]
 
     @property
     def robot_body_quat_w(self) -> torch.Tensor:
-        return self.robot.data.body_quat_w[:, self.body_indexes]
+        return self.robot.data.body_quat_w.torch[:, self.body_indexes]
 
     @property
     def robot_body_lin_vel_w(self) -> torch.Tensor:
-        return self.robot.data.body_lin_vel_w[:, self.body_indexes]
+        return self.robot.data.body_lin_vel_w.torch[:, self.body_indexes]
 
     @property
     def robot_body_ang_vel_w(self) -> torch.Tensor:
-        return self.robot.data.body_ang_vel_w[:, self.body_indexes]
+        return self.robot.data.body_ang_vel_w.torch[:, self.body_indexes]
 
     @property
     def robot_anchor_pos_w(self) -> torch.Tensor:
-        return self.robot.data.body_pos_w[:, self.robot_anchor_body_index]
+        return self.robot.data.body_pos_w.torch[:, self.robot_anchor_body_index]
 
     @property
     def robot_anchor_quat_w(self) -> torch.Tensor:
-        return self.robot.data.body_quat_w[:, self.robot_anchor_body_index]
+        return self.robot.data.body_quat_w.torch[:, self.robot_anchor_body_index]
 
     @property
     def robot_anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.robot.data.body_lin_vel_w[:, self.robot_anchor_body_index]
+        return self.robot.data.body_lin_vel_w.torch[:, self.robot_anchor_body_index]
 
     @property
     def robot_anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.robot.data.body_ang_vel_w[:, self.robot_anchor_body_index]
+        return self.robot.data.body_ang_vel_w.torch[:, self.robot_anchor_body_index]
 
     def _update_metrics(self):
         self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
@@ -267,13 +371,19 @@ class MotionCommand(CommandTerm):
         joint_vel = self.joint_vel.clone()
 
         joint_pos += sample_uniform(*self.cfg.joint_position_range, joint_pos.shape, joint_pos.device)
-        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+        soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits.torch[env_ids]
         joint_pos[env_ids] = torch.clip(
             joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
         )
-        self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
-        self.robot.write_root_state_to_sim(
-            torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
+        self.robot.write_joint_state_to_sim_index(
+            position=joint_pos[env_ids], velocity=joint_vel[env_ids], env_ids=env_ids
+        )
+        self.robot.write_root_link_pose_to_sim_index(
+            root_pose=torch.cat([root_pos[env_ids], root_ori[env_ids]], dim=-1),
+            env_ids=env_ids,
+        )
+        self.robot.write_root_com_velocity_to_sim_index(
+            root_velocity=torch.cat([root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
             env_ids=env_ids,
         )
 

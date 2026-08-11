@@ -11,18 +11,51 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.physics import PhysxAutoCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils.configclass import configclass
+from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+from isaaclab.visualizers import VisualizerCfg
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
+from isaaclab_ovphysx.physics import OvPhysxCfg
+from isaaclab_physx.physics import PhysxCfg
 
-##
-# Pre-defined configs
-##
-from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab_tasks.utils import PresetCfg
 
 import engineai_rl_lab.tasks.tracking.mdp as mdp
 from engineai_rl_lab.tasks.tracking.mdp.noise import Unoise as myUnoise
+
+##
+# Physics presets
+##
+
+
+@configclass
+class TrackingPhysicsCfg(PresetCfg):
+    """Physics backends supported by the tracking environments."""
+
+    isaacsim_physx = PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+    ovphysx = OvPhysxCfg(gpu_max_rigid_patch_count=10 * 2**15)
+    physx = PhysxAutoCfg(isaacsim_physx=isaacsim_physx, ovphysx=ovphysx)
+    newton_mjwarp = NewtonCfg(
+        solver_cfg=MJWarpSolverCfg(
+            njmax=1000,
+            nconmax=300,
+            cone="pyramidal",
+            impratio=1.0,
+            integrator="implicitfast",
+            use_mujoco_contacts=False,
+        ),
+        collision_cfg=NewtonCollisionPipelineCfg(max_triangle_pairs=2_500_000),
+        num_substeps=1,
+        debug_mode=False,
+        default_shape_cfg=NewtonShapeCfg(margin=0.0, ke=160000.0, kd=1100.0),
+    )
+    default = isaacsim_physx
+
 
 ##
 # Scene definition
@@ -298,6 +331,9 @@ class CurriculumCfg:
 class TrackingEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the locomotion velocity-tracking environment."""
 
+    # Keep Isaac Lab's Python actuator path enabled: T800's custom actuator implements
+    # command delay in ``compute()``, which the Newton-native actuator path bypasses.
+    sim: SimulationCfg = SimulationCfg(physics=TrackingPhysicsCfg(), use_newton_actuators=False)
     # Scene settings
     scene: MySceneCfg = MySceneCfg(num_envs=4096, env_spacing=2.5)
     # Basic settings
@@ -319,8 +355,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
-        # viewer settings
-        self.viewer.eye = (1.5, 1.5, 1.5)
-        self.viewer.origin_type = "asset_root"
-        self.viewer.asset_name = "robot"
+        if self.scene.contact_forces is not None:
+            self.scene.contact_forces.update_period = self.sim.dt
+        # visualizer settings shared by Kit and Newton viewers
+        self.sim.default_visualizer_cfg = VisualizerCfg(eye=(1.5, 1.5, 1.5), lookat=(0.0, 0.0, 0.8))

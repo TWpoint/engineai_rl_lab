@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import re
-import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import SceneEntityCfg
+import torch
+
 from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 
 from engineai_rl_lab.tasks.tracking.mdp.commands import MotionCommand
@@ -22,13 +21,13 @@ def robot_anchor_ori_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
 def robot_anchor_lin_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
-    return command.robot_anchor_vel_w[:, :3].view(env.num_envs, -1)
+    return command.robot_anchor_lin_vel_w.view(env.num_envs, -1)
 
 
 def robot_anchor_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
-    return command.robot_anchor_vel_w[:, 3:6].view(env.num_envs, -1)
+    return command.robot_anchor_ang_vel_w.view(env.num_envs, -1)
 
 
 def robot_body_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

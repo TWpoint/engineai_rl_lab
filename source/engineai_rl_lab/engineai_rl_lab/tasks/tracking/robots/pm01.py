@@ -1,7 +1,53 @@
+from importlib.util import find_spec
+from pathlib import Path
+
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets import apply_articulation_ordering_preset
 from isaaclab.assets.articulation import ArticulationCfg
-from isaaclab.utils import configclass
+from isaaclab.utils.configclass import configclass
+
+_ASSET_DIR = Path(__file__).resolve().parents[3] / "assets"
+
+
+def _rigid_body_properties():
+    """Build available backend fragments without requiring PhysX in kit-less Newton installs."""
+    if find_spec("isaaclab_physx") is None:
+        return None
+    from isaaclab_physx.sim.schemas import PhysxRigidBodyCfg
+
+    return [
+        PhysxRigidBodyCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        )
+    ]
+
+
+def _articulation_properties():
+    """Author self-collision settings for every installed physics backend."""
+    properties = []
+    if find_spec("isaaclab_physx") is not None:
+        from isaaclab_physx.sim.schemas import PhysxArticulationCfg
+
+        properties.append(
+            PhysxArticulationCfg(
+                enabled_self_collisions=True,
+                solver_position_iteration_count=8,
+                solver_velocity_iteration_count=4,
+            )
+        )
+    if find_spec("isaaclab_newton") is not None:
+        from isaaclab_newton.sim.schemas import NewtonArticulationCfg
+
+        properties.append(NewtonArticulationCfg(self_collision_enabled=True))
+    return properties or None
+
 
 # Physical Parameters (based on pm.py motor specs)
 # High-torque joints: Q90 motor (HIP_PITCH, HIP_ROLL, KNEE_PITCH)
@@ -32,20 +78,10 @@ class RobotArticulationCfg(ArticulationCfg):
 
 PM01_CYLINDER_CFG = RobotArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path="source/engineai_rl_lab/engineai_rl_lab/assets/pm01/serial_pm01_edu.usd",
+        usd_path=str(_ASSET_DIR / "pm01" / "serial_pm01_edu.usd"),
         activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            retain_accelerations=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
-            max_linear_velocity=1000.0,
-            max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
-        ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True, solver_position_iteration_count=8, solver_velocity_iteration_count=4
-        ),        
+        rigid_props=_rigid_body_properties(),
+        articulation_props=_articulation_properties(),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.9),
@@ -175,6 +211,7 @@ PM01_CYLINDER_CFG = RobotArticulationCfg(
         "J23_HEAD_YAW",
     ],
 )
+PM01_CYLINDER_CFG = apply_articulation_ordering_preset(PM01_CYLINDER_CFG, "physx")
 
 PM01_ACTION_SCALE = {}
 for a in PM01_CYLINDER_CFG.actuators.values():
@@ -184,7 +221,7 @@ for a in PM01_CYLINDER_CFG.actuators.values():
         e = {n: e for n in a.joint_names_expr}
     if not isinstance(s, dict):
         s = {n: s for n in a.joint_names_expr}
-    for n in e.keys():  
+    for n in e.keys():
         # if "ANKLE" in n:
         #     continue
         if n in s and s[n]:
