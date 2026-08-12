@@ -46,8 +46,8 @@ class TrackingPhysicsCfg(PresetCfg):
     physx = PhysxAutoCfg(isaacsim_physx=isaacsim_physx, ovphysx=ovphysx)
     newton_mjwarp = NewtonCfg(
         solver_cfg=MJWarpSolverCfg(
-            njmax=1000,
-            nconmax=300,
+            njmax=300,
+            nconmax=100,
             cone="pyramidal",
             impratio=1.0,
             integrator="implicitfast",
@@ -311,6 +311,10 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    invalid_robot_state = DoneTerm(
+        func=mdp.nonfinite_robot_state,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
     anchor_pos = DoneTerm(
         func=mdp.bad_anchor_pos_z_only,
         params={"command_name": "motion", "threshold": 0.25},

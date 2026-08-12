@@ -59,3 +59,29 @@ def bad_motion_body_pos_z_only(
     body_indexes = _get_body_indexes(command, body_names)
     error = torch.abs(command.body_pos_relative_w[:, body_indexes, -1] - command.robot_body_pos_w[:, body_indexes, -1])
     return torch.any(error > threshold, dim=-1)
+
+
+def nonfinite_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Terminate environments whose simulated robot state contains NaN or Inf.
+
+    A diverged physics state must be reset before observations are computed.  In
+    particular, comparisons in the geometric termination terms do not catch NaN
+    because every ordered comparison with NaN evaluates to false.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    state_tensors = (
+        asset.data.root_pos_w.torch,
+        asset.data.root_quat_w.torch,
+        asset.data.root_lin_vel_w.torch,
+        asset.data.root_ang_vel_w.torch,
+        asset.data.body_pos_w.torch,
+        asset.data.body_quat_w.torch,
+        asset.data.body_lin_vel_w.torch,
+        asset.data.body_ang_vel_w.torch,
+        asset.data.joint_pos.torch,
+        asset.data.joint_vel.torch,
+    )
+    invalid = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    for state in state_tensors:
+        invalid |= ~torch.isfinite(state).flatten(start_dim=1).all(dim=1)
+    return invalid

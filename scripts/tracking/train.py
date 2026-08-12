@@ -31,6 +31,7 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument("--distributed", action="store_true", default=False, help="Run training with multiple GPUs.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--registry_name", type=str, default=None, help="The name of the wandb registry.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to a local motion .npz file.")
@@ -75,6 +76,19 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+class FiniteResetRslRlVecEnvWrapper(RslRlVecEnvWrapper):
+    """Keep terminal rewards finite after resetting a diverged physics state."""
+
+    def step(self, actions: torch.Tensor):
+        observations, rewards, dones, extras = super().step(actions)
+        # A non-finite state is now terminated and reset before observations are
+        # returned. Reward computation precedes that reset, so sanitize only the
+        # rewards belonging to terminal environments. Non-terminal NaNs remain
+        # untouched and are still rejected by RSL-RL's checker.
+        rewards = torch.where(dones.bool() & ~torch.isfinite(rewards), torch.zeros_like(rewards), rewards)
+        return observations, rewards, dones, extras
 
 
 def dump_pickle(filename: str, data: object):
@@ -144,6 +158,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     pre_launch_video_config(env_cfg, args_cli=args_cli)
     with launch_simulation(env_cfg, args_cli):
+        # ``launch_simulation`` resolves the simulation device from LOCAL_RANK for
+        # distributed runs. RSL-RL must use the same device, and each rank needs a
+        # distinct seed to avoid collecting identical rollouts.
+        if args_cli.distributed:
+            global_rank = int(os.getenv("RANK", "0"))
+            agent_cfg.device = env_cfg.sim.device
+            env_cfg.seed = agent_cfg.seed + global_rank
+            agent_cfg.seed = env_cfg.seed
+
         env_cfg.log_dir = log_dir
         apply_video_recording(env_cfg, log_dir, args_cli)
         # create isaac environment after the requested physics backend has been launched
@@ -154,7 +177,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env = multi_agent_to_single_agent(env)
 
         # wrap around environment for rsl-rl
-        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        env = FiniteResetRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
         # create runner from rsl-rl
         train_cfg = sanitize_rsl_rl_cfg(agent_cfg.to_dict())
@@ -182,6 +205,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
         env.close()
+        if args_cli.distributed and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
