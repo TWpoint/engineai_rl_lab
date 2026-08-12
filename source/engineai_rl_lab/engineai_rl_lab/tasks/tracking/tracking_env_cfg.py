@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import MISSING
 
+import numpy as np
+import trimesh
+
 import isaaclab.sim as sim_utils
+import isaaclab.terrains as terrain_gen
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -20,7 +24,7 @@ from isaaclab.utils.configclass import configclass
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab.visualizers import VisualizerCfg
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
-from isaaclab_ovphysx.physics import OvPhysxCfg
+from isaaclab_ov.physics import OvPhysxCfg
 from isaaclab_physx.physics import PhysxCfg
 
 from isaaclab_tasks.utils import PresetCfg
@@ -71,6 +75,17 @@ VELOCITY_RANGE = {
 }
 
 
+def _thick_flat_terrain(
+    difficulty: float, cfg: terrain_gen.MeshPlaneTerrainCfg
+) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+    """Generate flat ground with non-zero volume for MuJoCo/Newton."""
+    del difficulty
+    thickness = 0.1
+    mesh = trimesh.creation.box(extents=(cfg.size[0], cfg.size[1], thickness))
+    mesh.apply_translation((cfg.size[0] / 2.0, cfg.size[1] / 2.0, -thickness / 2.0))
+    return [mesh], np.array((cfg.size[0] / 2.0, cfg.size[1] / 2.0, 0.0))
+
+
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
@@ -78,17 +93,21 @@ class MySceneCfg(InteractiveSceneCfg):
     # ground terrain
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="plane",
+        terrain_type="generator",
+        terrain_generator=terrain_gen.TerrainGeneratorCfg(
+            size=(300.0, 300.0),
+            num_rows=1,
+            num_cols=1,
+            sub_terrains={
+                "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=1.0, function=_thick_flat_terrain)
+            },
+        ),
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
             static_friction=1.0,
             dynamic_friction=1.0,
-        ),
-        visual_material=sim_utils.MdlFileCfg(
-            mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
-            project_uvw=True,
         ),
     )
     # robots
