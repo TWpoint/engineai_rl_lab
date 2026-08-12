@@ -10,6 +10,7 @@
 """Parse CLI arguments before selecting an Isaac Lab physics backend."""
 
 import argparse
+import time
 
 import numpy as np
 import torch
@@ -101,8 +102,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         body_indexes=torch.arange(len(robot.body_names), dtype=torch.long, device=sim.device),
         device=sim.device,
     )
+    playback_fps = float(np.asarray(motion.fps).reshape(-1)[0])
+    if playback_fps <= 0.0:
+        raise ValueError(f"Motion FPS must be positive, got {playback_fps}.")
+    frame_period = 1.0 / playback_fps
+    next_frame_time = time.perf_counter()
+
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
     print(f"[INFO]: Replaying {len(robot.joint_names)} joints and {len(robot.body_names)} bodies by name.")
+    print(f"[INFO]: Playback rate: {playback_fps:g} Hz ({frame_period * 1000.0:.2f} ms per frame).")
 
     # Simulation loop
     while sim.is_headless_or_exist_active_visualizer():
@@ -131,6 +139,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
         pos_lookat = root_pose[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
+
+        # Pace motion frames against wall-clock time. If rendering takes longer
+        # than one frame period, rebase the deadline to avoid a catch-up burst.
+        next_frame_time += frame_period
+        sleep_duration = next_frame_time - time.perf_counter()
+        if sleep_duration > 0.0:
+            time.sleep(sleep_duration)
+        else:
+            next_frame_time = time.perf_counter()
 
 
 def main():
