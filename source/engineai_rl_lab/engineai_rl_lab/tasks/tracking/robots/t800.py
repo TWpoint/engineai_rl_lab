@@ -107,7 +107,7 @@ class RobotArticulationCfg(ArticulationCfg):
 
 T800_CYLINDER_CFG = RobotArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=str(_ASSET_DIR / "t800" / "serial_t800.usd"),
+        usd_path=str(_ASSET_DIR / "t800" / "serial_t800_stable.usda"),
         activate_contact_sensors=True,
         rigid_props=_rigid_body_properties(),
         articulation_props=_articulation_properties(),
