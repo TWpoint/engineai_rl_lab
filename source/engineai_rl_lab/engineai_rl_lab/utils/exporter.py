@@ -92,11 +92,13 @@ class _OnnxModelGraphExporter(torch.nn.Module):
         self.input_groups = list(model._input_dims)
         self.input_dims = dict(model._input_dims)
         self.input_shapes = {
-            name: tuple(env.observation_manager.group_obs_dim[name]) for name in self.input_groups
+            name: self._resolve_input_shape(env.observation_manager.group_obs_dim[name], name)
+            for name in self.input_groups
         }
         self.input_normalizers = copy.deepcopy(model.input_normalizers)
         self.nodes = copy.deepcopy(model.nodes)
         self.incoming = copy.deepcopy(model._incoming)
+        self.node_input_modes = copy.deepcopy(getattr(model, "_node_input_modes", {}))
         self.execution_order = list(model._execution_order)
         self.output_endpoint = model.output_endpoint
         if model.distribution is not None:
@@ -111,9 +113,24 @@ class _OnnxModelGraphExporter(torch.nn.Module):
         }
         for node_name in self.execution_order:
             parts = [tensors[source] for source in self.incoming[node_name]]
-            node_input = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+            if self.node_input_modes.get(node_name, "concat") == "list":
+                node_input = parts
+            else:
+                node_input = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
             tensors[f"nodes.{node_name}.output"] = self.nodes[node_name](node_input)
         return self.deterministic_output(tensors[self.output_endpoint])
+
+    @staticmethod
+    def _resolve_input_shape(group_dim, group_name):
+        """Resolve tensor shape for concatenated or single-term non-concatenated groups."""
+        if isinstance(group_dim, tuple):
+            return group_dim
+        if isinstance(group_dim, list) and len(group_dim) == 1:
+            return tuple(group_dim[0])
+        raise ValueError(
+            f"ModelGraph ONNX input group '{group_name}' must be concatenated or contain exactly one term; "
+            f"got dimensions {group_dim}."
+        )
 
     def export(self, path, filename):
         self.to("cpu")

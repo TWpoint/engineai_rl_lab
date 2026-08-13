@@ -32,7 +32,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v1:T800FlatWoStateEstimationEnvCfgV1",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:T800FlatV1PPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v1:T800FlatV1PPORunnerCfg",
     },
 )
 
@@ -42,7 +42,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v1:T800FlatWoStateEstimationEnvCfgV1",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:T800FlatV1N1PPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v1:T800FlatV1N1PPORunnerCfg",
     },
 )
 
@@ -52,7 +52,17 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v2:T800FlatWoStateEstimationEnvCfgV2",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:T800FlatV2PPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v2:T800FlatV2PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v3:T800FlatWoStateEstimationEnvCfgV3",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v3:T800FlatV3PPORunnerCfg",
     },
 )
 
