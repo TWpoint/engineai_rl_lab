@@ -15,7 +15,7 @@
 
 ## 兼容性
 
-当前代码面向 Isaac Lab 3.0，迁移和验证基线为 `develop` 分支提交 `891116e68dac3d417cb5de2d722d16d44ae3f06d`，并使用 Isaac Lab 3.0 Beta 2 引入的多物理后端和 preset CLI。3.0 仍在快速迭代；升级 Isaac Lab 后请先阅读[官方发布说明](https://github.com/isaac-sim/IsaacLab/releases)和[迁移指南](https://isaac-sim.github.io/IsaacLab/develop/source/migration/migrating_to_isaaclab_3-0.html)。
+当前代码面向 Isaac Lab 3.0 Beta 2，当前环境验证基线为 `develop` 分支提交 `ef4611e0152d3422ac1aa88fe0f0a3922fe8bd7e`。该分支仍在快速迭代，建议安装时固定此提交，不要直接使用不断变化的 `develop` HEAD。
 
 - Newton MJWarp 可在不安装 Isaac Sim 的情况下运行；训练时选择 `physics=newton_mjwarp`。
 - Isaac Sim PhysX/Kit 是可选后端，需要 Isaac Sim 6.0.1；选择 `physics=isaacsim_physx --viz kit`。
@@ -31,15 +31,14 @@
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git-lfs
+sudo apt-get install -y git git-lfs python3.12-venv
 git lfs install
 ```
 
-先将变量设为包含 `IsaacLab` 和本仓库的工作区目录。当前机器可使用
-`export ENGINEAI_WORKSPACE=/home/ubuntu/engineai-newton`；其他机器请替换示例路径：
+先将变量设为包含 `IsaacLab`、本仓库和虚拟环境的工作区目录。当前机器使用：
 
 ```bash
-export ENGINEAI_WORKSPACE=/path/to/your/workspace
+export ENGINEAI_WORKSPACE=/mnt/workspace/lpz/engineai
 cd "$ENGINEAI_WORKSPACE"
 ```
 
@@ -57,26 +56,46 @@ git clone https://github.com/engineai-robotics/engineai_rl_lab.git
 git -C engineai_rl_lab lfs pull
 ```
 
-### 安装 Isaac Lab 3.0 和 Newton
+### 创建并激活 Python 环境
 
-下面假设 `IsaacLab`、Python 3.12 虚拟环境 `engineai-newton` 和本仓库都位于
-`$ENGINEAI_WORKSPACE` 下：
+Isaac Lab 3.0 只支持 Python 3.12。当前机器的虚拟环境目录名为 `engineai`：
 
 ```bash
 cd "$ENGINEAI_WORKSPACE"
-source "$ENGINEAI_WORKSPACE/engineai-newton/bin/activate"
-
-cd IsaacLab
-./isaaclab.sh -i 'newton,rl[rsl-rl],visualizer[newton]'
+python3.12 -m venv engineai
+source engineai/bin/activate
+python -m pip install --upgrade pip
+python --version  # 应为 3.12.x
 ```
 
-这会安装 Newton、RSL-RL 和 Newton visualizer，但不会安装 Isaac Sim。若还需要 PhysX/Kit，请改用：
+环境已经存在时，不要重复创建，只需运行 `source engineai/bin/activate`。
+
+### 安装 Isaac Lab 3.0 和 Newton
+
+若还没有 Isaac Lab 源码，克隆并固定到已验证提交：
 
 ```bash
-./isaaclab.sh -i 'isaacsim,newton,rl[rsl-rl],visualizer[kit]'
+cd "$ENGINEAI_WORKSPACE"
+git clone https://github.com/isaac-sim/IsaacLab.git
+git -C IsaacLab checkout ef4611e0152d3422ac1aa88fe0f0a3922fe8bd7e
 ```
 
-全新环境请按 Isaac Lab 3.0 官方流程创建 Python 3.12 环境，并在 IsaacLab 根目录运行 `./isaaclab.sh -i`。详细步骤见 [Isaac Lab 安装指南](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html)。
+在已激活的 `engineai` 环境中安装 Newton、Newton GL visualizer 和 RSL-RL：
+
+```bash
+source "$ENGINEAI_WORKSPACE/engineai/bin/activate"
+
+cd "$ENGINEAI_WORKSPACE/IsaacLab"
+./isaaclab.sh -i 'newton,rl[rsl-rl]'
+```
+
+Newton GL visualizer 属于当前 Isaac Lab 的基础依赖，`visualizer[newton]` 是无效 selector，不要使用。若还需要 Isaac Sim PhysX/Kit，在上述命令完成后追加安装：
+
+```bash
+./isaaclab.sh -i 'newton,rl[rsl-rl],visualizer[kit]'
+```
+
+不要使用旧文档中的 `isaacsim` 安装 token；当前 CLI 通过 `visualizer[kit]` 安装 Isaac Sim 6.0.1。可先运行 `./isaaclab.sh --help` 核对当前提交支持的 selector。
 
 ### 安装 engineai_rl_lab
 
@@ -84,12 +103,32 @@ cd IsaacLab
 
 ```bash
 cd "$ENGINEAI_WORKSPACE/engineai_rl_lab"
-python -m pip install -e source/engineai_rl_lab
-python -m pip check
-python -c "import isaaclab, isaaclab_newton, newton, warp, rsl_rl, engineai_rl_lab; print('environment ready')"
+python -m pip install -e 'source/engineai_rl_lab[export]'
+python -c "import MNN, gymnasium, isaaclab, isaaclab_newton, newton, onnx, rsl_rl, torch, trimesh, wandb, warp, yaml, engineai_rl_lab; print('environment ready')"
 ```
 
-仅看到 `isaaclab` 的 editable 安装并不代表环境完整；上面的导入检查还会确认 Newton、Warp 相关依赖和 RSL-RL 已实际安装。
+`engineai_rl_lab` 的直接运行时依赖由 `source/engineai_rl_lab/setup.py` 管理；Isaac Lab/Newton 由于必须与指定源码提交成套安装，仍由 `isaaclab.sh` 管理，不应再用普通 `requirements.txt` 重复解析。推荐命令安装了 `[export]` 依赖，其中固定 `MNN==3.6.1`，用于把 `policy.onnx` 转为部署所需的 `policy.mnn`。仅看到 `isaaclab` 的 editable 安装并不代表环境完整，上面的导入检查会覆盖训练、导出和日志所需模块。
+
+依赖按用途划分如下：
+
+- 基础训练：`numpy`、`torch`、`gymnasium`、`trimesh`、`PyYAML`、`onnx`、`wandb`、`rsl-rl-lib==5.4.1`。
+- RSL-RL 传递依赖：固定的 `rsl-rl-lib==5.4.1` 会安装 `tensorboard`、`onnxscript`、`torchvision`、`tensordict` 和 `GitPython`，无需在本项目中重复声明。
+- Isaac Lab 组件：代码直接使用 `isaaclab`、`isaaclab_newton`、`isaaclab_physx`、`isaaclab_ov`、`isaaclab_rl` 和 `isaaclab_tasks`；它们由固定提交下的 `isaaclab.sh` 成套安装，并已同步写入扩展清单 `config/extension.toml`。
+- MNN 导出：安装 `[export]`，即 `MNN==3.6.1`；它不是普通 ONNX 导出的必需项，但没有它就不会生成 `policy.mnn`。
+- 视频录制：按需运行 `python -m pip install -e 'source/engineai_rl_lab[video]'`。
+- Neptune 日志：按需运行 `python -m pip install -e 'source/engineai_rl_lab[neptune]'`。
+- 所有项目可选依赖：运行 `python -m pip install -e 'source/engineai_rl_lab[all]'`。
+
+`engineai_robotics_native_sdk`、机器人端 MNN C++ runtime、MuJoCo 和虚拟手柄属于部署 SDK/容器依赖，不是本 Python 包的依赖，仍需按照 SDK 仓库的安装脚本安装。用于转换模型的 Python MNN 与部署端 runtime 应保持兼容；当前验证版本为 3.6.1。
+
+当前验证环境的关键版本为 Python 3.12、Isaac Sim 6.0.1（可选）、Newton 1.5.0、Warp 1.16.0、PyTorch 2.11.0、RSL-RL 5.4.1。若安装器解析出不同的大版本，请优先检查 Isaac Lab 是否位于上述固定提交。
+
+### 常见安装问题
+
+- `python3.12 -m venv` 不可用：Ubuntu 上先安装 `python3.12-venv`。
+- USD 文件只有约 130 字节或加载失败：运行 `git -C engineai_rl_lab lfs pull`。
+- `No module named isaaclab_newton/newton/rsl_rl`：确认先激活 `engineai`，再从 `IsaacLab` 目录执行安装命令。
+- 不要单独升级 `torch`、`warp-lang` 或 `newton`；需要修复环境时，在固定的 Isaac Lab 提交重新运行安装器。Isaac Lab 会有意覆盖部分 Isaac Sim wheel 的严格依赖版本，因此安装了可选 Isaac Sim 后，通用的 `pip check` 可能报告已知的元数据冲突，不应把它作为此环境唯一的成功标准。
 
 ## 训练
 ### whole body tracking
@@ -170,6 +209,8 @@ engineai_robotics_env
 engineai_robotics_env
 python3 tools/virtual_gamepad/virtual_gamepad.py
 ```
+
+`play.py` 会先导出 `exported/policy.onnx`，再调用 `MNN.tools.mnnconvert` 生成 `exported/policy.mnn`。如果只安装了最小依赖，脚本会提示缺少 MNN 并跳过第二步；部署前应使用上面的 `[export]` 安装方式，并确认两个文件都已生成。
 ![手柄控制界面](docs/gamepad.png)
 
 遥控器操作请参阅[engineai_robotics_native_sdk](https://github.com/engineai-robotics/engineai_robotics_native_sdk)中的键位。

@@ -18,13 +18,24 @@ with open(os.path.join(EXTENSION_PATH, "config", "extension.toml"), "rb") as ext
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
+    "gymnasium>=1.2",
     "numpy",
     "onnx",
     "PyYAML",
-    "rsl-rl-lib>=5.4.1,<6",
+    "rsl-rl-lib==5.4.1",
     "torch",
+    "trimesh",
     "wandb",
 ]
+
+# Optional dependencies grouped by workflow. MNN is not needed to train, but is required to
+# produce the policy.mnn artifact consumed by engineai_robotics_native_sdk.
+EXTRAS_REQUIRE = {
+    "export": ["MNN==3.6.1"],
+    "neptune": ["neptune"],
+    "video": ["moviepy>=1.0.3,<2"],
+    "all": ["MNN==3.6.1", "moviepy>=1.0.3,<2", "neptune"],
+}
 
 # Installation operation
 setup(
@@ -40,6 +51,7 @@ setup(
     description=EXTENSION_TOML_DATA["package"]["description"],
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
     install_requires=INSTALL_REQUIRES,
+    extras_require=EXTRAS_REQUIRE,
     license="BSD-3-Clause",
     include_package_data=True,
     package_data={"engineai_rl_lab": ["assets/**/*", "assets/**/**/*"]},

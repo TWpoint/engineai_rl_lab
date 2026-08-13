@@ -101,12 +101,13 @@ def dump_pickle(filename: str, data: object):
 
 
 def sanitize_rsl_rl_cfg(cfg: dict) -> dict:
-    """Remove Isaac Lab compatibility keys unsupported by the installed rsl-rl models."""
-    supported_model_keys = {"class_name", "hidden_dims", "activation", "obs_normalization", "distribution_cfg"}
+    """Remove only legacy model keys, preserving CNN/RNN and custom-model options."""
+    legacy_model_keys = {"stochastic", "init_noise_std", "noise_std_type", "state_dependent_std"}
     for model_name in ("actor", "critic"):
         model_cfg = cfg.get(model_name)
         if isinstance(model_cfg, dict):
-            cfg[model_name] = {k: v for k, v in model_cfg.items() if k in supported_model_keys}
+            for key in legacy_model_keys:
+                model_cfg.pop(key, None)
     return cfg
 
 

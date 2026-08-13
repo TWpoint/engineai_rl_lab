@@ -16,7 +16,7 @@ This project provides a set of reinforcement learning environments based on Isaa
 
 ## Compatibility
 
-The current code targets Isaac Lab 3.0. The migration and validation baseline is commit `891116e68dac3d417cb5de2d722d16d44ae3f06d` on `develop`, using the multi-physics backend and preset CLI introduced in Isaac Lab 3.0 Beta 2. Because 3.0 is still evolving, review the official [release notes](https://github.com/isaac-sim/IsaacLab/releases) and [migration guide](https://isaac-sim.github.io/IsaacLab/develop/source/migration/migrating_to_isaaclab_3-0.html) before updating Isaac Lab.
+The current code targets Isaac Lab 3.0 Beta 2. The environment was validated against commit `ef4611e0152d3422ac1aa88fe0f0a3922fe8bd7e` on `develop`. Pin this commit during installation instead of following the moving `develop` HEAD.
 
 - Newton MJWarp runs without Isaac Sim; select it with `physics=newton_mjwarp`.
 - Isaac Sim PhysX/Kit is optional and requires Isaac Sim 6.0.1; select it with `physics=isaacsim_physx --viz kit`.
@@ -32,15 +32,14 @@ The robot USD assets and example checkpoints are managed by Git LFS. Install and
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git-lfs
+sudo apt-get install -y git git-lfs python3.12-venv
 git lfs install
 ```
 
-First set the workspace directory that contains `IsaacLab` and this repository. On the current machine, use
-`export ENGINEAI_WORKSPACE=/home/ubuntu/engineai-newton`; replace the example path elsewhere:
+Set the workspace directory containing `IsaacLab`, this repository, and the virtual environment. On the current machine, use:
 
 ```bash
-export ENGINEAI_WORKSPACE=/path/to/your/workspace
+export ENGINEAI_WORKSPACE=/mnt/workspace/lpz/engineai
 cd "$ENGINEAI_WORKSPACE"
 ```
 
@@ -58,26 +57,46 @@ git clone https://github.com/engineai-robotics/engineai_rl_lab.git
 git -C engineai_rl_lab lfs pull
 ```
 
-### Install Isaac Lab 3.0 and Newton
+### Create and activate the Python environment
 
-The commands below assume that `IsaacLab`, the Python 3.12 virtual environment named `engineai-newton`, and this
-repository are all direct children of `$ENGINEAI_WORKSPACE`:
+Isaac Lab 3.0 requires Python 3.12. The virtual environment on the current machine is named `engineai`:
 
 ```bash
 cd "$ENGINEAI_WORKSPACE"
-source "$ENGINEAI_WORKSPACE/engineai-newton/bin/activate"
-
-cd IsaacLab
-./isaaclab.sh -i 'newton,rl[rsl-rl],visualizer[newton]'
+python3.12 -m venv engineai
+source engineai/bin/activate
+python -m pip install --upgrade pip
+python --version  # must be 3.12.x
 ```
 
-This installs Newton, RSL-RL, and the Newton visualizer without installing Isaac Sim. To also use PhysX/Kit, run:
+If the environment already exists, only run `source engineai/bin/activate`.
+
+### Install Isaac Lab 3.0 and Newton
+
+Clone and pin the validated Isaac Lab revision if it is not present yet:
 
 ```bash
-./isaaclab.sh -i 'isaacsim,newton,rl[rsl-rl],visualizer[kit]'
+cd "$ENGINEAI_WORKSPACE"
+git clone https://github.com/isaac-sim/IsaacLab.git
+git -C IsaacLab checkout ef4611e0152d3422ac1aa88fe0f0a3922fe8bd7e
 ```
 
-For a fresh environment, follow the official Python 3.12 environment and `./isaaclab.sh -i` workflow in the [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/develop/source/setup/installation/index.html).
+Install Newton, its built-in Newton GL visualizer, and RSL-RL in the activated environment:
+
+```bash
+source "$ENGINEAI_WORKSPACE/engineai/bin/activate"
+
+cd "$ENGINEAI_WORKSPACE/IsaacLab"
+./isaaclab.sh -i 'newton,rl[rsl-rl]'
+```
+
+The Newton GL visualizer is a base dependency in this revision; `visualizer[newton]` is invalid. To also install Isaac Sim PhysX/Kit, run:
+
+```bash
+./isaaclab.sh -i 'newton,rl[rsl-rl],visualizer[kit]'
+```
+
+Do not use the old `isaacsim` install token. This CLI installs Isaac Sim 6.0.1 through `visualizer[kit]`. Run `./isaaclab.sh --help` to verify selectors supported by the pinned revision.
 
 ### Install engineai_rl_lab
 
@@ -85,12 +104,32 @@ After `isaaclab.sh` finishes, the current directory is still `IsaacLab`. Use the
 
 ```bash
 cd "$ENGINEAI_WORKSPACE/engineai_rl_lab"
-python -m pip install -e source/engineai_rl_lab
-python -m pip check
-python -c "import isaaclab, isaaclab_newton, newton, warp, rsl_rl, engineai_rl_lab; print('environment ready')"
+python -m pip install -e 'source/engineai_rl_lab[export]'
+python -c "import MNN, gymnasium, isaaclab, isaaclab_newton, newton, onnx, rsl_rl, torch, trimesh, wandb, warp, yaml, engineai_rl_lab; print('environment ready')"
 ```
 
-An editable `isaaclab` package alone does not prove that the environment is complete. The import check also verifies that Newton, its Warp-backed runtime, and RSL-RL are actually installed.
+Direct project dependencies are declared in `source/engineai_rl_lab/setup.py`. Isaac Lab and Newton must be installed as a matched source stack by `isaaclab.sh`, so they are intentionally not duplicated in a regular `requirements.txt`. The recommended command includes the `[export]` extra, which pins `MNN==3.6.1` to convert `policy.onnx` into the deployable `policy.mnn`. The import check covers the modules needed for training, export, and logging.
+
+Dependencies are grouped by workflow:
+
+- Base training: `numpy`, `torch`, `gymnasium`, `trimesh`, `PyYAML`, `onnx`, `wandb`, and `rsl-rl-lib==5.4.1`.
+- RSL-RL transitive dependencies: the pinned `rsl-rl-lib==5.4.1` installs `tensorboard`, `onnxscript`, `torchvision`, `tensordict`, and `GitPython`; this project does not duplicate them.
+- Isaac Lab components: the code directly uses `isaaclab`, `isaaclab_newton`, `isaaclab_physx`, `isaaclab_ov`, `isaaclab_rl`, and `isaaclab_tasks`. They are installed as a matched stack by `isaaclab.sh` at the pinned revision and are also declared in `config/extension.toml`.
+- MNN export: install `[export]` (`MNN==3.6.1`). ONNX export works without it, but `policy.mnn` will not be generated.
+- Video recording: optionally run `python -m pip install -e 'source/engineai_rl_lab[video]'`.
+- Neptune logging: optionally run `python -m pip install -e 'source/engineai_rl_lab[neptune]'`.
+- Every project extra: run `python -m pip install -e 'source/engineai_rl_lab[all]'`.
+
+`engineai_robotics_native_sdk`, the robot-side MNN C++ runtime, MuJoCo, and the virtual gamepad are SDK/container dependencies rather than dependencies of this Python package. Install them with the SDK repository scripts. Keep the Python converter compatible with the deployment runtime; the currently validated MNN version is 3.6.1.
+
+Validated key versions are Python 3.12, optional Isaac Sim 6.0.1, Newton 1.5.0, Warp 1.16.0, PyTorch 2.11.0, and RSL-RL 5.4.1. If the installer resolves different major versions, first verify the Isaac Lab commit.
+
+### Common installation failures
+
+- `python3.12 -m venv` is unavailable: install `python3.12-venv` on Ubuntu.
+- USD files are about 130 bytes or fail to load: run `git -C engineai_rl_lab lfs pull`.
+- `isaaclab_newton`, `newton`, or `rsl_rl` cannot be imported: activate `engineai` before running the installer from `IsaacLab`.
+- Do not upgrade `torch`, `warp-lang`, or `newton` separately; rerun the installer at the pinned Isaac Lab revision to repair the environment. Isaac Lab intentionally overrides several strict dependency pins from the optional Isaac Sim wheels, so a generic `pip check` may report known metadata conflicts after Kit is installed and should not be the only readiness test.
 
 ## Training
 ### Whole-Body Tracking
@@ -171,6 +210,8 @@ engineai_robotics_env
 engineai_robotics_env
 python3 tools/virtual_gamepad/virtual_gamepad.py
 ```
+
+`play.py` first writes `exported/policy.onnx`, then invokes `MNN.tools.mnnconvert` to produce `exported/policy.mnn`. With only the minimal dependencies it warns and skips the MNN step. Before deployment, install the `[export]` extra and verify that both files exist.
 
 ![Gamepad control interface](docs/gamepad.png)
 

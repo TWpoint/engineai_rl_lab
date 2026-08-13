@@ -40,6 +40,11 @@ class T800FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
 
 
+@configclass
+class T800FlatV1PPORunnerCfg(T800FlatPPORunnerCfg):
+    run_name = "v1"
+
+
 LOW_FREQ_SCALE = 0.5
 
 
