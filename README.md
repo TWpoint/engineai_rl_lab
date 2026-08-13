@@ -25,6 +25,24 @@
 
 ## 安装
 
+### 默认开发环境
+
+本工作区默认使用 `$ENGINEAI_WORKSPACE/engineai` 虚拟环境。执行训练、测试、格式化、依赖检查或其他 Python 命令前，必须先激活它：
+
+```bash
+cd "$ENGINEAI_WORKSPACE"
+source engineai/bin/activate
+```
+
+在当前标准工作区中，对应命令为：
+
+```bash
+cd /mnt/workspace/lpz/engineai
+source engineai/bin/activate
+```
+
+除非明确要求重建环境，否则不要调用系统 Python、不要另外创建 `.venv`，也不要通过 `uv run --with ...` 临时解析并下载另一套 PyTorch/CUDA 依赖。激活后统一使用 `python`、`python -m pytest` 和 `python -m pip`；缺少依赖时也应安装到该 `engineai` 环境中。
+
 ### 准备 Git LFS
 
 机器人 USD、示例 checkpoint 等文件由 Git LFS 管理。必须先安装并初始化 Git LFS，再拉取仓库内容；否则 USD 文件只是约 130 字节的文本指针，仿真无法加载机器人。在 Ubuntu 上运行：
