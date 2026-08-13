@@ -129,8 +129,8 @@ python -c "import MNN, gymnasium, isaaclab, isaaclab_newton, newton, onnx, rsl_r
 
 依赖按用途划分如下：
 
-- 基础训练：`numpy`、`torch`、`gymnasium`、`trimesh`、`PyYAML`、`onnx`、`wandb`、`rsl-rl-lib==5.4.1`。
-- RSL-RL 传递依赖：固定的 `rsl-rl-lib==5.4.1` 会安装 `tensorboard`、`onnxscript`、`torchvision`、`tensordict` 和 `GitPython`，无需在本项目中重复声明。
+- 基础训练：`numpy`、`torch`、`gymnasium`、`trimesh`、`PyYAML`、`onnx`、`wandb`，以及基于上游 5.4.1 的 [TWpoint RSL-RL fork](https://github.com/TWpoint/rsl_rl/tree/engineai/custom-networks)。该 fork 提供 EngineAI 所需的 model graph/custom network 支持。
+- RSL-RL 传递依赖：该 TWpoint RSL-RL fork 会安装 `tensorboard`、`onnxscript`、`torchvision`、`tensordict` 和 `GitPython`，无需在本项目中重复声明。
 - Isaac Lab 组件：代码直接使用 `isaaclab`、`isaaclab_newton`、`isaaclab_physx`、`isaaclab_ov`、`isaaclab_rl` 和 `isaaclab_tasks`；它们由固定提交下的 `isaaclab.sh` 成套安装，并已同步写入扩展清单 `config/extension.toml`。
 - MNN 导出：安装 `[export]`，即 `MNN==3.6.1`；它不是普通 ONNX 导出的必需项，但没有它就不会生成 `policy.mnn`。
 - 视频录制：按需运行 `python -m pip install -e 'source/engineai_rl_lab[video]'`。
@@ -139,7 +139,7 @@ python -c "import MNN, gymnasium, isaaclab, isaaclab_newton, newton, onnx, rsl_r
 
 `engineai_robotics_native_sdk`、机器人端 MNN C++ runtime、MuJoCo 和虚拟手柄属于部署 SDK/容器依赖，不是本 Python 包的依赖，仍需按照 SDK 仓库的安装脚本安装。用于转换模型的 Python MNN 与部署端 runtime 应保持兼容；当前验证版本为 3.6.1。
 
-当前验证环境的关键版本为 Python 3.12、Isaac Sim 6.0.1（可选）、Newton 1.5.0、Warp 1.16.0、PyTorch 2.11.0、RSL-RL 5.4.1。若安装器解析出不同的大版本，请优先检查 Isaac Lab 是否位于上述固定提交。
+当前验证环境的关键版本为 Python 3.12、Isaac Sim 6.0.1（可选）、Newton 1.5.0、Warp 1.16.0、PyTorch 2.11.0，以及基于 RSL-RL 5.4.1 的 TWpoint fork。若安装器解析出不同的大版本，请优先检查 Isaac Lab 的固定提交和 RSL-RL 的 `engineai/custom-networks` 分支。
 
 ### 常见安装问题
 
@@ -292,6 +292,6 @@ sudo ./run_robot.sh pm01_edu
 ## 致谢
 本项目得益于以下开源项目的支持和贡献，在此表示衷心的感谢：
 - **[IsaacLab](https://github.com/isaac-sim/IsaacLab)** — 训练和运行仿真实验的基础框架。
-- **[rsl_rl](https://github.com/leggedrobotics/rsl_rl)** — 适用于足式机器人的高性能强化学习库。
+- **[TWpoint/rsl_rl](https://github.com/TWpoint/rsl_rl/tree/engineai/custom-networks)** — 基于官方 RSL-RL 的 EngineAI fork，增加 model graph/custom network 支持。
 - **[BeyondMimic](https://github.com/HybridRobotics/whole_body_tracking)** — 项目结构启发及有价值的功能实现参考。
 - **[MNN](https://github.com/alibaba/mnn)** — 轻量级高性能推理引擎，用于端侧部署。

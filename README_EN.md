@@ -112,8 +112,8 @@ Direct project dependencies are declared in `source/engineai_rl_lab/setup.py`. I
 
 Dependencies are grouped by workflow:
 
-- Base training: `numpy`, `torch`, `gymnasium`, `trimesh`, `PyYAML`, `onnx`, `wandb`, and `rsl-rl-lib==5.4.1`.
-- RSL-RL transitive dependencies: the pinned `rsl-rl-lib==5.4.1` installs `tensorboard`, `onnxscript`, `torchvision`, `tensordict`, and `GitPython`; this project does not duplicate them.
+- Base training: `numpy`, `torch`, `gymnasium`, `trimesh`, `PyYAML`, `onnx`, `wandb`, and the [TWpoint RSL-RL fork](https://github.com/TWpoint/rsl_rl/tree/engineai/custom-networks), based on upstream 5.4.1. The fork provides the model graph/custom network support required by EngineAI.
+- RSL-RL transitive dependencies: the TWpoint RSL-RL fork installs `tensorboard`, `onnxscript`, `torchvision`, `tensordict`, and `GitPython`; this project does not duplicate them.
 - Isaac Lab components: the code directly uses `isaaclab`, `isaaclab_newton`, `isaaclab_physx`, `isaaclab_ov`, `isaaclab_rl`, and `isaaclab_tasks`. They are installed as a matched stack by `isaaclab.sh` at the pinned revision and are also declared in `config/extension.toml`.
 - MNN export: install `[export]` (`MNN==3.6.1`). ONNX export works without it, but `policy.mnn` will not be generated.
 - Video recording: optionally run `python -m pip install -e 'source/engineai_rl_lab[video]'`.
@@ -122,7 +122,7 @@ Dependencies are grouped by workflow:
 
 `engineai_robotics_native_sdk`, the robot-side MNN C++ runtime, MuJoCo, and the virtual gamepad are SDK/container dependencies rather than dependencies of this Python package. Install them with the SDK repository scripts. Keep the Python converter compatible with the deployment runtime; the currently validated MNN version is 3.6.1.
 
-Validated key versions are Python 3.12, optional Isaac Sim 6.0.1, Newton 1.5.0, Warp 1.16.0, PyTorch 2.11.0, and RSL-RL 5.4.1. If the installer resolves different major versions, first verify the Isaac Lab commit.
+Validated key versions are Python 3.12, optional Isaac Sim 6.0.1, Newton 1.5.0, Warp 1.16.0, PyTorch 2.11.0, and the TWpoint fork based on RSL-RL 5.4.1. If the installer resolves different major versions, first verify the pinned Isaac Lab commit and RSL-RL's `engineai/custom-networks` branch.
 
 ### Common installation failures
 
@@ -280,6 +280,6 @@ This project is open-sourced under the **BSD 3-Clause License**. See the [LICENS
 This project benefits from the support and contributions of the following open-source projects. We sincerely thank them:
 
 - **[IsaacLab](https://github.com/isaac-sim/IsaacLab)** - The base framework for training and running simulation experiments.
-- **[rsl_rl](https://github.com/leggedrobotics/rsl_rl)** - A high-performance reinforcement learning library for legged robots.
+- **[TWpoint/rsl_rl](https://github.com/TWpoint/rsl_rl/tree/engineai/custom-networks)** - EngineAI's RSL-RL fork with model graph/custom network support.
 - **[BeyondMimic](https://github.com/HybridRobotics/whole_body_tracking)** - Inspiration for the project structure and reference implementation of valuable features.
 - **[MNN](https://github.com/alibaba/mnn)** - A lightweight, high-performance inference engine for edge deployment.

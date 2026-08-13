@@ -5,6 +5,7 @@ import importlib.metadata as metadata
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -75,6 +76,26 @@ def sanitize_rsl_rl_cfg(cfg: dict) -> dict:
             for key in legacy_model_keys:
                 model_cfg.pop(key, None)
     return cfg
+
+
+def get_mnn_filename(resume_path: str, run_name: str | None) -> str:
+    """Build an MNN filename from the loaded run and checkpoint names."""
+    run_dir_name = pathlib.Path(resume_path).parent.name
+    timestamped_run = re.match(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_(.+)$", run_dir_name)
+    resolved_run_name = timestamped_run.group(1) if timestamped_run else run_name
+    if not resolved_run_name:
+        resolved_run_name = run_dir_name
+
+    checkpoint_stem = pathlib.Path(resume_path).stem
+    model_number = re.search(r"(\d+)(?!.*\d)", checkpoint_stem)
+    model_id = model_number.group(1) if model_number else checkpoint_stem
+    if model_number is None:
+        print(
+            f"[WARN] Checkpoint '{pathlib.Path(resume_path).name}' has no model number; "
+            f"using '{model_id}' in the MNN filename."
+        )
+
+    return f"policy_{resolved_run_name}_{model_id}.mnn"
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point", play_mode=True)
@@ -171,7 +192,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
         # Convert the exported policy to MNN when the optional converter is installed.
         onnx_file = os.path.join(export_model_dir, "policy.onnx")
-        mnn_file = os.path.join(export_model_dir, "policy.mnn")
+        mnn_file = os.path.join(export_model_dir, get_mnn_filename(resume_path, agent_cfg.run_name))
 
         if os.path.exists(onnx_file):
             if importlib.util.find_spec("MNN") is None:

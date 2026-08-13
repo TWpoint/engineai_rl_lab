@@ -3,8 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# import numpy as np
+import copy
 import os
+
+# import numpy as np
 
 import onnx
 
@@ -65,8 +67,70 @@ def export_motion_policy_as_onnx(
         )
         return
 
+    # RSL-RL's ModelGraph is itself the actor model (rather than an
+    # actor-critic container), so IsaacLab's legacy exporter cannot find an
+    # ``actor``/``student`` attribute on it.  Export a tensor-only copy of the
+    # graph; this also avoids putting TensorDict operations in the ONNX graph.
+    if all(
+        hasattr(actor_critic, attr)
+        for attr in ("_input_dims", "_incoming", "_execution_order", "nodes", "output_endpoint")
+    ):
+        policy_exporter = _OnnxModelGraphExporter(env, actor_critic, verbose)
+        policy_exporter.export(path, filename)
+        return
+
     policy_exporter = _OnnxMotionPolicyExporter(env, actor_critic, normalizer, verbose)
     policy_exporter.export(path, filename)
+
+
+class _OnnxModelGraphExporter(torch.nn.Module):
+    """Tensor-only ONNX adapter for an RSL-RL ModelGraph policy."""
+
+    def __init__(self, env, model, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        self.input_groups = list(model._input_dims)
+        self.input_dims = dict(model._input_dims)
+        self.input_shapes = {
+            name: tuple(env.observation_manager.group_obs_dim[name]) for name in self.input_groups
+        }
+        self.input_normalizers = copy.deepcopy(model.input_normalizers)
+        self.nodes = copy.deepcopy(model.nodes)
+        self.incoming = copy.deepcopy(model._incoming)
+        self.execution_order = list(model._execution_order)
+        self.output_endpoint = model.output_endpoint
+        if model.distribution is not None:
+            self.deterministic_output = copy.deepcopy(model.distribution.as_deterministic_output_module())
+        else:
+            self.deterministic_output = torch.nn.Identity()
+
+    def forward(self, *inputs):
+        tensors = {
+            f"inputs.{name}": self.input_normalizers[name](value)
+            for name, value in zip(self.input_groups, inputs, strict=True)
+        }
+        for node_name in self.execution_order:
+            parts = [tensors[source] for source in self.incoming[node_name]]
+            node_input = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+            tensors[f"nodes.{node_name}.output"] = self.nodes[node_name](node_input)
+        return self.deterministic_output(tensors[self.output_endpoint])
+
+    def export(self, path, filename):
+        self.to("cpu")
+        self.eval()
+        dummy_inputs = tuple(torch.zeros(1, *self.input_shapes[name]) for name in self.input_groups)
+        # Keep the historic single-policy input name expected by deployment.
+        input_names = ["obs"] if self.input_groups == ["policy"] else self.input_groups
+        torch.onnx.export(
+            self,
+            dummy_inputs,
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=18,
+            verbose=self.verbose,
+            input_names=input_names,
+            output_names=["actions"],
+        )
 
 
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):

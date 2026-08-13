@@ -22,7 +22,8 @@ INSTALL_REQUIRES = [
     "numpy",
     "onnx",
     "PyYAML",
-    "rsl-rl-lib==5.4.1",
+    # EngineAI's fork adds model-graph/custom-network support on top of upstream v5.4.1.
+    "rsl-rl-lib @ git+https://github.com/TWpoint/rsl_rl.git@engineai/custom-networks",
     "torch",
     "trimesh",
     "wandb",
