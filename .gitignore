@@ -34,13 +34,25 @@ docker/.container.cfg
 .codex
 
 # Outputs
-**/output/*
-**/outputs/*
-**/videos/*
-**/wandb/*
-**/.neptune/*
+**/output/
+**/outputs/
+**/logs/
+**/runs/
+**/videos/
+**/wandb/
+**/.neptune/
+**/checkpoints/
 docker/artifacts/
 *.tmp
+
+# Training artifacts
+**/events.out.tfevents.*
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.onnx.data
+**/*.mnn
 
 # Doc Outputs
 **/docs/_build/*
@@ -53,8 +65,6 @@ _build
 .lastformat
 
 # RL-Games
-**/runs/*
-# **/logs/*
 **/recordings/*
 
 # Pre-Trained Checkpoints
@@ -77,11 +87,6 @@ mydocs
 source/engineai_rl_lab/engineai_rl_lab/tasks/locomotion
 scripts/amp
 datasets/amp
-logs/rsl_rl/amp_velocity_flat_pm01
 source/engineai_rl_lab/engineai_rl_lab/assets/pm01_23dof_simplified
 datasets/mytracking
 scripts/test
-
-# logs/rsl_rl
-outputs
-logs/rsl_rl/backup
