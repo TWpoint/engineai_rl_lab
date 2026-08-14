@@ -4,6 +4,7 @@
 
     python scripts/csv_to_npz.py --robot pm01 --input_fps 30 -f <path_to_input.csv>
     python scripts/csv_to_npz.py --robot t800 --input_fps 30 -f <path_to_input.csv>
+    python scripts/csv_to_npz.py --robot t800 --include_key_body_poses -f <path_to_input.csv>
     python scripts/csv_to_npz.py --robot pm01 --input_quaternion_order wxyz -f <legacy_motion.csv>
 
 The CSV columns are ``root_x, root_y, root_z, quaternion, joint_positions``.
@@ -57,6 +58,14 @@ parser.add_argument(
     choices=["isaacsim_physx", "newton_mjwarp"],
     help="Physics backend used to load and replay the robot.",
 )
+parser.add_argument(
+    "--include_key_body_poses",
+    action="store_true",
+    help=(
+        "Additionally save a 14-link T800 key-body pose subset. "
+        "This is optional and does not change the existing full-body arrays."
+    ),
+)
 
 # append simulation launcher cli args
 add_launcher_args(parser)
@@ -64,7 +73,8 @@ add_launcher_args(parser)
 args_cli = parser.parse_args()
 if not args_cli.output_name:
     # generate at the same location as input file
-    args_cli.output_name = os.path.splitext(args_cli.input_file)[0] + ".npz"
+    output_suffix = "_key_body_poses.npz" if args_cli.include_key_body_poses else ".npz"
+    args_cli.output_name = os.path.splitext(args_cli.input_file)[0] + output_suffix
 
 
 import torch
@@ -80,7 +90,6 @@ from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.physics import PhysicsCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, quat_slerp
 
@@ -88,6 +97,25 @@ ROBOT_CFGS = {
     "pm01": PM01_CYLINDER_CFG,
     "t800": T800_CYLINDER_CFG,
 }
+
+# Key bodies used by the T800 tracking task. Keep this order stable because
+# downstream task observations flatten the body axis in order.
+T800_KEY_BODY_NAMES = [
+    "LINK_BASE",
+    "LINK_HIP_ROLL_L",
+    "LINK_KNEE_PITCH_L",
+    "LINK_ANKLE_ROLL_L",
+    "LINK_HIP_ROLL_R",
+    "LINK_KNEE_PITCH_R",
+    "LINK_ANKLE_ROLL_R",
+    "LINK_WAIST_YAW",
+    "LINK_SHOULDER_ROLL_L",
+    "LINK_ELBOW_YAW_L",
+    "LINK_WRIST_END_L",
+    "LINK_SHOULDER_ROLL_R",
+    "LINK_ELBOW_YAW_R",
+    "LINK_WRIST_END_R",
+]
 
 
 def quaternion_to_xyzw(quaternions: torch.Tensor, input_order: str) -> torch.Tensor:
@@ -111,15 +139,16 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
     """Configuration for a replay motions scene."""
 
     # ground plane
-    ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
+    ground = AssetBaseCfg(
+        prim_path="/World/defaultGroundPlane",
+        spawn=sim_utils.CuboidCfg(size=(100.0, 100.0, 0.1)),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.05)),
+    )
 
     # lights
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
-        spawn=sim_utils.DomeLightCfg(
-            intensity=750.0,
-            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
-        ),
+        spawn=sim_utils.DomeLightCfg(intensity=750.0),
     )
 
     # articulation
@@ -287,6 +316,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     robot = scene["robot"]
     robot_joint_indexes = robot.find_joints(scene.cfg.robot.joint_sdk_names, preserve_order=True)[0]
 
+    key_body_indexes = None
+    if args_cli.include_key_body_poses:
+        if args_cli.robot != "t800":
+            raise ValueError("--include_key_body_poses currently supports only --robot t800.")
+        missing_body_names = [name for name in T800_KEY_BODY_NAMES if name not in robot.body_names]
+        if missing_body_names:
+            raise ValueError(f"T800 articulation is missing key bodies: {missing_body_names}.")
+        key_body_indexes = robot.find_bodies(T800_KEY_BODY_NAMES, preserve_order=True)[0]
+
     # ------- data logger -------------------------------------------------------
     log = {
         "fps": [args_cli.output_fps],
@@ -300,6 +338,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         "body_names": robot.body_names,
         "quaternion_order": "xyzw",
     }
+    if key_body_indexes is not None:
+        log.update(
+            {
+                "key_body_names": T800_KEY_BODY_NAMES,
+                "key_body_pos_w": [],
+                "key_body_quat_w": [],
+            }
+        )
     file_saved = False
     # --------------------------------------------------------------------------
 
@@ -347,6 +393,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             log["body_quat_w"].append(robot.data.body_quat_w.torch[0, :].cpu().numpy().copy())
             log["body_lin_vel_w"].append(robot.data.body_lin_vel_w.torch[0, :].cpu().numpy().copy())
             log["body_ang_vel_w"].append(robot.data.body_ang_vel_w.torch[0, :].cpu().numpy().copy())
+            if key_body_indexes is not None:
+                log["key_body_pos_w"].append(
+                    robot.data.body_pos_w.torch[0, key_body_indexes].cpu().numpy().copy()
+                )
+                log["key_body_quat_w"].append(
+                    robot.data.body_quat_w.torch[0, key_body_indexes].cpu().numpy().copy()
+                )
 
         if reset_flag and not file_saved:
             file_saved = True
@@ -359,6 +412,9 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 "body_ang_vel_w",
             ):
                 log[k] = np.stack(log[k], axis=0)
+            if key_body_indexes is not None:
+                log["key_body_pos_w"] = np.stack(log["key_body_pos_w"], axis=0)
+                log["key_body_quat_w"] = np.stack(log["key_body_quat_w"], axis=0)
 
             np.savez(args_cli.output_name, **log)
             print("[INFO]: Motion npz file saved to", args_cli.output_name)

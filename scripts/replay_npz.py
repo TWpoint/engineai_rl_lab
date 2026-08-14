@@ -5,6 +5,7 @@
     # Usage
     python scripts/replay_npz.py --robot pm01 --input_file <path_to_motion.npz>
     python scripts/replay_npz.py --robot t800 --input_file <path_to_motion.npz>
+    python scripts/replay_npz.py --robot t800 --visualize_key_body_poses --input_file <path_to_motion.npz>
 """
 
 """Parse CLI arguments before selecting an Isaac Lab physics backend."""
@@ -22,6 +23,11 @@ parser = argparse.ArgumentParser(description="Replay converted motions.")
 parser.add_argument("--registry_name", type=str, default=None, help="The name of the wandb registry.")
 parser.add_argument("--input_file", type=str, default=None, help="Path to a local .npz motion file.")
 parser.add_argument("--robot", type=str, default="pm01", choices=["pm01", "t800"], help="Robot type to use.")
+parser.add_argument(
+    "--visualize_key_body_poses",
+    action="store_true",
+    help="Visualize key-body positions and orientations stored in the NPZ as coordinate frames.",
+)
 parser.add_argument(
     "--physics",
     default="isaacsim_physx",
@@ -44,10 +50,11 @@ from engineai_rl_lab.tasks.tracking.robots.t800 import T800_CYLINDER_CFG
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg, AssetBaseCfg
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.physics import PhysicsCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 
 ROBOT_CFGS = {
@@ -60,14 +67,15 @@ ROBOT_CFGS = {
 class ReplayMotionsSceneCfg(InteractiveSceneCfg):
     """Configuration for a replay motions scene."""
 
-    ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
+    ground = AssetBaseCfg(
+        prim_path="/World/defaultGroundPlane",
+        spawn=sim_utils.CuboidCfg(size=(100.0, 100.0, 0.1)),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.05)),
+    )
 
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
-        spawn=sim_utils.DomeLightCfg(
-            intensity=750.0,
-            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
-        ),
+        spawn=sim_utils.DomeLightCfg(intensity=750.0),
     )
 
     robot: ArticulationCfg = ROBOT_CFGS[args_cli.robot].replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -102,6 +110,38 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         body_indexes=torch.arange(len(robot.body_names), dtype=torch.long, device=sim.device),
         device=sim.device,
     )
+
+    key_body_names = None
+    key_body_pos_w = None
+    key_body_quat_w = None
+    key_body_visualizer = None
+    if args_cli.visualize_key_body_poses:
+        with np.load(motion_file) as data:
+            required_fields = {"key_body_names", "key_body_pos_w", "key_body_quat_w"}
+            missing_fields = sorted(required_fields.difference(data.files))
+            if missing_fields:
+                raise ValueError(
+                    f"Motion file {motion_file!r} does not contain key-body poses. Missing fields: {missing_fields}. "
+                    "Regenerate it with csv_to_npz.py --include_key_body_poses."
+                )
+            key_body_names = data["key_body_names"].astype(str).tolist()
+            key_body_pos_w = torch.tensor(data["key_body_pos_w"], dtype=torch.float32, device=sim.device)
+            key_body_quat_w = torch.tensor(data["key_body_quat_w"], dtype=torch.float32, device=sim.device)
+
+        if key_body_pos_w.shape != (motion.time_step_total, len(key_body_names), 3):
+            raise ValueError(
+                f"Invalid key_body_pos_w shape {tuple(key_body_pos_w.shape)} for "
+                f"{motion.time_step_total} frames and {len(key_body_names)} key bodies."
+            )
+        if key_body_quat_w.shape != (motion.time_step_total, len(key_body_names), 4):
+            raise ValueError(
+                f"Invalid key_body_quat_w shape {tuple(key_body_quat_w.shape)} for "
+                f"{motion.time_step_total} frames and {len(key_body_names)} key bodies."
+            )
+
+        key_body_visualizer_cfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/KeyBodyPoses")
+        key_body_visualizer_cfg.markers["frame"].scale = (0.12, 0.12, 0.12)
+        key_body_visualizer = VisualizationMarkers(key_body_visualizer_cfg)
     playback_fps = float(np.asarray(motion.fps).reshape(-1)[0])
     if playback_fps <= 0.0:
         raise ValueError(f"Motion FPS must be positive, got {playback_fps}.")
@@ -110,6 +150,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
     print(f"[INFO]: Replaying {len(robot.joint_names)} joints and {len(robot.body_names)} bodies by name.")
+    if key_body_names is not None:
+        print(f"[INFO]: Visualizing {len(key_body_names)} key-body pose frames: {key_body_names}")
     print(f"[INFO]: Playback rate: {playback_fps:g} Hz ({frame_period * 1000.0:.2f} ms per frame).")
 
     # Simulation loop
@@ -136,6 +178,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         scene.write_data_to_sim()
         sim.render()  # We don't want physic (sim.step())
         scene.update(sim_dt)
+
+        if key_body_visualizer is not None:
+            marker_positions = key_body_pos_w[time_steps[0]] + scene.env_origins[0]
+            marker_orientations = key_body_quat_w[time_steps[0]]
+            key_body_visualizer.visualize(marker_positions, marker_orientations)
 
         pos_lookat = root_pose[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
