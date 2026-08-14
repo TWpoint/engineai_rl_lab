@@ -28,8 +28,8 @@ class T800FlatV7N3PPORunnerCfg(T800FlatV7N2PPORunnerCfg):
         actor.nodes[encoder_name]["cell"].update(
             {
                 "output_dim": 256,
-                "num_heads": 8,
-                "ffn_dim": 1024,
+                "num_heads": 4,
+                "ffn_dim": 512,
             }
         )
 
