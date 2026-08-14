@@ -87,6 +87,83 @@ def motion_body_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     return mat[..., :2].reshape(env.num_envs, -1)
 
 
+def _motion_time_steps(command: MotionCommand, frame_offsets: list[int] | tuple[int, ...]) -> torch.Tensor:
+    """Build clamped, frame-major motion indexes for arbitrary relative offsets."""
+    if not frame_offsets:
+        raise ValueError("frame_offsets must contain at least one frame")
+    if any(not isinstance(offset, int) for offset in frame_offsets):
+        raise TypeError("frame_offsets must contain integers only")
+    offsets = torch.tensor(frame_offsets, dtype=torch.long, device=command.device)
+    return (command.time_steps[:, None] + offsets[None, :]).clamp_(0, command.motion.time_step_total - 1)
+
+
+def motion_body_pos_b_window(
+    env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
+) -> torch.Tensor:
+    """Reference body positions at the requested offsets from the current frame.
+
+    Every pose is expressed in the robot's *current* anchor frame. The result is
+    flattened in frame-major order so existing MLP command encoders can consume it.
+    Motion indexes outside the clip are clamped to the first or last frame.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    time_steps = _motion_time_steps(command, frame_offsets)
+    body_pos_w = command.motion.body_pos_w[time_steps] + env.scene.env_origins[:, None, None, :]
+    body_quat_w = command.motion.body_quat_w[time_steps]
+    num_frames, num_bodies = time_steps.shape[1], len(command.cfg.body_names)
+    pos_b, _ = subtract_frame_transforms(
+        command.robot_anchor_pos_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        command.robot_anchor_quat_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        body_pos_w,
+        body_quat_w,
+    )
+    return pos_b.reshape(env.num_envs, -1)
+
+
+def motion_body_ori_b_window(
+    env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
+) -> torch.Tensor:
+    """Reference body 6D orientations over a configurable past/future window."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    time_steps = _motion_time_steps(command, frame_offsets)
+    body_pos_w = command.motion.body_pos_w[time_steps] + env.scene.env_origins[:, None, None, :]
+    body_quat_w = command.motion.body_quat_w[time_steps]
+    num_frames, num_bodies = time_steps.shape[1], len(command.cfg.body_names)
+    _, ori_b = subtract_frame_transforms(
+        command.robot_anchor_pos_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        command.robot_anchor_quat_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        body_pos_w,
+        body_quat_w,
+    )
+    mat = matrix_from_quat(ori_b)
+    return mat[..., :2].reshape(env.num_envs, -1)
+
+
+def motion_body_pose_b_window_by_entity(
+    env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
+) -> torch.Tensor:
+    """Reference body poses grouped by entity over a temporal window.
+
+    Each pose contains the body position followed by its 6D rotation. The
+    returned shape is ``(num_envs, num_bodies, num_frames * 9)`` so that each
+    body forms one entity token containing its complete temporal trajectory.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    time_steps = _motion_time_steps(command, frame_offsets)
+    body_pos_w = command.motion.body_pos_w[time_steps] + env.scene.env_origins[:, None, None, :]
+    body_quat_w = command.motion.body_quat_w[time_steps]
+    num_frames, num_bodies = time_steps.shape[1], len(command.cfg.body_names)
+    pos_b, ori_b = subtract_frame_transforms(
+        command.robot_anchor_pos_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        command.robot_anchor_quat_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        body_pos_w,
+        body_quat_w,
+    )
+    ori_6d_b = matrix_from_quat(ori_b)[..., :2].reshape(env.num_envs, num_frames, num_bodies, 6)
+    pose_b = torch.cat((pos_b, ori_6d_b), dim=-1)
+    return pose_b.permute(0, 2, 1, 3).reshape(env.num_envs, num_bodies, num_frames * 9)
+
+
 def motion_anchor_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
