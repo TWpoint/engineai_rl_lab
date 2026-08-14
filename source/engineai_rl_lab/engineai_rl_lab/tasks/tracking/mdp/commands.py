@@ -371,6 +371,13 @@ class MotionCommand(CommandTerm):
         self._adaptive_sync_counter = 0
         if not 0.0 <= self.cfg.adaptive_uniform_ratio <= 1.0:
             raise ValueError("adaptive_uniform_ratio must be in [0, 1]")
+        if (
+            self.cfg.adaptive_failure_rate_max_over_mean is not None
+            and self.cfg.adaptive_failure_rate_max_over_mean <= 0.0
+        ):
+            raise ValueError("adaptive_failure_rate_max_over_mean must be positive or None")
+        if self.cfg.adaptive_pre_failure_sample_window < 0:
+            raise ValueError("adaptive_pre_failure_sample_window must be non-negative")
         if self.cfg.adaptive_sync_interval <= 0:
             raise ValueError("adaptive_sync_interval must be positive")
 
@@ -563,6 +570,11 @@ class MotionCommand(CommandTerm):
                 )
 
         failure_rate = self.bin_failed_count / self.bin_episode_count.clamp_min(1.0)
+        if self.cfg.adaptive_failure_rate_max_over_mean is not None:
+            failure_rate_upper_bound = (
+                failure_rate.mean() * self.cfg.adaptive_failure_rate_max_over_mean
+            )
+            failure_rate = failure_rate.clamp(max=failure_rate_upper_bound)
         weighted_failure_rate = failure_rate * self.bin_prior_weights
         failure_probabilities = weighted_failure_rate / weighted_failure_rate.sum().clamp_min(1.0e-12)
         uniform_probabilities = self.bin_prior_weights
@@ -574,9 +586,17 @@ class MotionCommand(CommandTerm):
         sampled_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
         self.motion_ids[env_ids] = self.bin_motion_ids[sampled_bins]
         bin_lengths = self.bin_ends[sampled_bins] - self.bin_starts[sampled_bins]
-        self.time_steps[env_ids] = self.bin_starts[sampled_bins] + (
+        sampled_time_steps = self.bin_starts[sampled_bins] + (
             torch.rand(len(env_ids), device=self.device) * bin_lengths
         ).long()
+        if self.cfg.adaptive_pre_failure_sample_window > 0:
+            pre_failure_offsets = torch.randint(
+                self.cfg.adaptive_pre_failure_sample_window,
+                (len(env_ids),),
+                device=self.device,
+            )
+            sampled_time_steps = (sampled_time_steps - pre_failure_offsets).clamp_min(0)
+        self.time_steps[env_ids] = sampled_time_steps
         self._has_sampled[env_ids] = True
 
         # Metrics
@@ -745,6 +765,8 @@ class MotionCommandCfg(CommandTermCfg):
     adaptive_bin_size: int = 50
     adaptive_prior_count: float = 1.0
     adaptive_failure_multiplier: float = 1.0
+    adaptive_failure_rate_max_over_mean: float | None = None
+    adaptive_pre_failure_sample_window: int = 0
     adaptive_sync_interval: int = 200
     adaptive_sequence_length_agnostic: bool = True
 

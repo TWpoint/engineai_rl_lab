@@ -15,3 +15,5 @@ class T800FlatWoStateEstimationEnvCfgV7Scale(T800FlatWoStateEstimationEnvCfgV7):
     def __post_init__(self):
         super().__post_init__()
         self.commands.motion.motion_file = LAFAN_SCALE_MOTION_MANIFEST
+        self.commands.motion.adaptive_failure_rate_max_over_mean = 200.0
+        self.commands.motion.adaptive_pre_failure_sample_window = 200
