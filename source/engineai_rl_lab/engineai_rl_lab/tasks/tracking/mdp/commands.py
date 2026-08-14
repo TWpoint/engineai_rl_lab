@@ -4,10 +4,13 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import MISSING
+from fnmatch import fnmatch
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import yaml
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
@@ -26,6 +29,97 @@ from isaaclab.utils.math import (
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def resolve_motion_files(manifest: str | os.PathLike[str]) -> list[str]:
+    """Resolve a motion npz or a recursive ``files``/``exclude_files`` YAML manifest.
+
+    Paths and glob patterns are relative to the YAML file containing them.  Included
+    manifests contribute both their motions and their exclusions; exclusions are
+    applied after the complete include tree has been expanded.
+    """
+
+    root = Path(manifest).expanduser().resolve()
+    if root.suffix.lower() != ".yaml" and root.suffix.lower() != ".yml":
+        if not root.is_file():
+            raise FileNotFoundError(f"Motion file does not exist: {root}")
+        return [str(root)]
+
+    visiting: set[Path] = set()
+
+    def _walk(path: Path) -> tuple[list[Path], list[str]]:
+        path = path.resolve()
+        if path in visiting:
+            raise ValueError(f"Recursive motion manifest include detected at {path}")
+        if not path.is_file():
+            raise FileNotFoundError(f"Motion manifest does not exist: {path}")
+        visiting.add(path)
+        with path.open(encoding="utf-8") as stream:
+            document = yaml.safe_load(stream) or {}
+        if not isinstance(document, dict):
+            raise ValueError(f"Motion manifest {path} must contain a mapping")
+
+        motions: list[Path] = []
+        exclusions: list[str] = []
+        manifest_keys = {"files", "exclude_files"}
+        direct_mapping = not manifest_keys.intersection(document)
+        if direct_mapping:
+            if not all(isinstance(name, str) and isinstance(value, str) for name, value in document.items()):
+                raise ValueError(
+                    f"Motion mapping {path} must contain string motion-name to file-path entries"
+                )
+            file_entries = list(document.values())
+            exclude_entries = []
+        else:
+            unknown_keys = set(document) - manifest_keys
+            if unknown_keys:
+                raise ValueError(f"Unknown keys in motion manifest {path}: {sorted(unknown_keys)}")
+            file_entries = document.get("files", [])
+            exclude_entries = document.get("exclude_files", [])
+            if not isinstance(file_entries, list) or not isinstance(exclude_entries, list):
+                raise ValueError(f"files and exclude_files in {path} must be lists")
+
+        for entry in file_entries:
+            candidate = Path(os.path.abspath(path.parent / os.fspath(entry)))
+            # ScaleBFM's legacy direct mapping interpreted relative values from cwd.
+            if direct_mapping and not candidate.exists() and not Path(entry).is_absolute():
+                cwd_candidate = Path(os.path.abspath(os.fspath(entry)))
+                if cwd_candidate.exists():
+                    candidate = cwd_candidate
+            if candidate.suffix.lower() in {".yaml", ".yml"}:
+                child_motions, child_exclusions = _walk(candidate)
+                motions.extend(child_motions)
+                exclusions.extend(child_exclusions)
+            else:
+                motions.append(candidate)
+        for entry in exclude_entries:
+            candidate = Path(os.path.abspath(path.parent / os.fspath(entry)))
+            if candidate.suffix.lower() in {".yaml", ".yml"} and candidate.is_file():
+                _, child_exclusions = _walk(candidate)
+                exclusions.extend(child_exclusions)
+            else:
+                exclusions.append(candidate.as_posix())
+        visiting.remove(path)
+        return motions, exclusions
+
+    motions, exclusions = _walk(root)
+    exact_exclusions = {pattern for pattern in exclusions if not any(char in pattern for char in "*?[")}
+    glob_exclusions = [pattern for pattern in exclusions if pattern not in exact_exclusions]
+    unique: list[str] = []
+    seen: set[Path] = set()
+    for motion in motions:
+        motion_path = motion.as_posix()
+        if motion in seen or motion_path in exact_exclusions or any(
+            fnmatch(motion_path, pattern) for pattern in glob_exclusions
+        ):
+            continue
+        if motion.suffix.lower() != ".npz":
+            raise ValueError(f"Unsupported motion file in {root}: {motion}")
+        seen.add(motion)
+        unique.append(str(motion))
+    if not unique:
+        raise ValueError(f"Motion manifest {root} did not resolve to any .npz files")
+    return unique
 
 
 class MotionLoader:
@@ -157,6 +251,57 @@ class MotionLoader:
         return self._body_ang_vel_w[:, self._body_indexes]
 
 
+class MotionCollection:
+    """A concatenated, variable-length motion set with safe per-motion indexing."""
+
+    _FIELDS = ("joint_pos", "joint_vel", "body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w")
+
+    def __init__(
+        self,
+        motion_files: Sequence[str],
+        body_indexes: Sequence[int],
+        device: str,
+        storage_device: str,
+        joint_names: Sequence[str],
+        body_names: Sequence[str],
+    ):
+        loaders = [
+            MotionLoader(path, body_indexes, device=storage_device, joint_names=joint_names, body_names=body_names)
+            for path in motion_files
+        ]
+        fps = [float(np.asarray(loader.fps).item()) for loader in loaders]
+        if any(not math.isclose(value, fps[0]) for value in fps[1:]):
+            raise ValueError(f"All motions must have the same fps; found {sorted(set(fps))}")
+        self.fps = fps[0]
+        self.device = torch.device(device)
+        self.storage_device = torch.device(storage_device)
+        self.names = list(motion_files)
+        self.time_totals = torch.tensor([loader.time_step_total for loader in loaders], device=device)
+        if torch.any(self.time_totals < 2):
+            bad = [path for path, loader in zip(motion_files, loaders) if loader.time_step_total < 2]
+            raise ValueError(f"Motion clips must contain at least two frames: {bad}")
+        self.time_offsets = torch.zeros(len(loaders), dtype=torch.long, device=device)
+        if len(loaders) > 1:
+            self.time_offsets[1:] = torch.cumsum(self.time_totals[:-1], dim=0)
+        self.time_step_total = int(self.time_totals.sum().item())
+        for field in self._FIELDS:
+            setattr(self, field, torch.cat([getattr(loader, field) for loader in loaders], dim=0))
+
+    @property
+    def num_motions(self) -> int:
+        return len(self.names)
+
+    def global_indices(self, motion_ids: torch.Tensor, time_steps: torch.Tensor) -> torch.Tensor:
+        lengths = self.time_totals[motion_ids]
+        clamped = torch.minimum(torch.clamp_min(time_steps, 0), lengths - 1)
+        return self.time_offsets[motion_ids] + clamped
+
+    def sample(self, field: str, motion_ids: torch.Tensor, time_steps: torch.Tensor) -> torch.Tensor:
+        indexes = self.global_indices(motion_ids, time_steps)
+        values = getattr(self, field)[indexes.to(self.storage_device)]
+        return values.to(self.device, non_blocking=True)
+
+
 class MotionCommand(CommandTerm):
     cfg: MotionCommandCfg
 
@@ -170,25 +315,64 @@ class MotionCommand(CommandTerm):
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
-        self.motion = MotionLoader(
-            self.cfg.motion_file,
+        motion_files = resolve_motion_files(self.cfg.motion_file)
+        storage_device = self.cfg.motion_data_device
+        if storage_device == "auto":
+            storage_device = "cpu" if len(motion_files) > 1 else self.device
+        self.motion = MotionCollection(
+            motion_files,
             self.body_indexes,
             device=self.device,
+            storage_device=storage_device,
             joint_names=self.robot.joint_names,
             body_names=self.cfg.body_names,
         )
+        self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._has_sampled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._motion_cache = {
+            field: torch.empty((self.num_envs, *getattr(self.motion, field).shape[1:]), device=self.device)
+            for field in self.motion._FIELDS
+        }
+        self._window_time_steps: torch.Tensor | None = None
+        self._window_motion_ids: torch.Tensor | None = None
+        self._window_body_pos: torch.Tensor | None = None
+        self._window_body_quat: torch.Tensor | None = None
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 3] = 1.0
 
-        self.bin_count = int(self.motion.time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1
-        self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
-        self._current_bin_failed = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
-        self.kernel = torch.tensor(
-            [self.cfg.adaptive_lambda**i for i in range(self.cfg.adaptive_kernel_size)], device=self.device
-        )
-        self.kernel = self.kernel / self.kernel.sum()
+        if self.cfg.adaptive_bin_size <= 0:
+            raise ValueError("adaptive_bin_size must be positive")
+        bins: list[tuple[int, int, int]] = []
+        motion_bin_offsets = []
+        motion_bin_counts = []
+        for motion_id, length in enumerate(self.motion.time_totals.tolist()):
+            motion_bin_offsets.append(len(bins))
+            motion_bins = [
+                (motion_id, start, min(start + self.cfg.adaptive_bin_size, length))
+                for start in range(0, length, self.cfg.adaptive_bin_size)
+            ]
+            motion_bin_counts.extend([len(motion_bins)] * len(motion_bins))
+            bins.extend(motion_bins)
+        bin_table = torch.tensor(bins, dtype=torch.long, device=self.device)
+        self.bin_motion_ids, self.bin_starts, self.bin_ends = bin_table.unbind(dim=1)
+        self.bin_prior_weights = (self.bin_ends - self.bin_starts).float()
+        if self.cfg.adaptive_sequence_length_agnostic:
+            self.bin_prior_weights /= torch.tensor(motion_bin_counts, device=self.device)
+        self.bin_prior_weights /= self.bin_prior_weights.sum()
+        self.motion_bin_offsets = torch.tensor(motion_bin_offsets, dtype=torch.long, device=self.device)
+        self.bin_count = len(bins)
+        initial_count = float(self.cfg.adaptive_prior_count)
+        self.bin_episode_count = torch.full((self.bin_count,), initial_count, device=self.device)
+        self.bin_failed_count = torch.full((self.bin_count,), initial_count, device=self.device)
+        self._current_bin_episodes = torch.zeros(self.bin_count, device=self.device)
+        self._current_bin_failed = torch.zeros(self.bin_count, device=self.device)
+        self._adaptive_sync_counter = 0
+        if not 0.0 <= self.cfg.adaptive_uniform_ratio <= 1.0:
+            raise ValueError("adaptive_uniform_ratio must be in [0, 1]")
+        if self.cfg.adaptive_sync_interval <= 0:
+            raise ValueError("adaptive_sync_interval must be positive")
 
         self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self.device)
@@ -206,45 +390,96 @@ class MotionCommand(CommandTerm):
     def command(self) -> torch.Tensor:
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
 
+    def _refresh_motion_cache(self, env_ids: torch.Tensor | None = None) -> None:
+        """Gather the current reference frame once for all downstream MDP terms."""
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        if len(env_ids) == 0:
+            return
+        motion_ids = self.motion_ids[env_ids]
+        time_steps = self.time_steps[env_ids]
+        for field, cache in self._motion_cache.items():
+            cache[env_ids] = self.motion.sample(field, motion_ids, time_steps)
+
+    def sample_body_window(self, time_steps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather a motion window, reusing overlapping frames from the previous step."""
+        motion_ids = self.motion_ids[:, None].expand_as(time_steps)
+        if self._window_time_steps is None or self._window_time_steps.shape != time_steps.shape:
+            self._window_body_pos = self.motion.sample("body_pos_w", motion_ids, time_steps)
+            self._window_body_quat = self.motion.sample("body_quat_w", motion_ids, time_steps)
+        else:
+            same_window = torch.all(time_steps == self._window_time_steps, dim=1) & (
+                self.motion_ids == self._window_motion_ids
+            )
+            can_shift = (
+                torch.all(time_steps[:, :-1] == self._window_time_steps[:, 1:], dim=1)
+                & (self.motion_ids == self._window_motion_ids)
+                & ~same_window
+            )
+            refresh = ~(same_window | can_shift)
+            if torch.any(can_shift):
+                self._window_body_pos[can_shift, :-1] = self._window_body_pos[can_shift, 1:]
+                self._window_body_quat[can_shift, :-1] = self._window_body_quat[can_shift, 1:]
+                next_motion_ids = self.motion_ids[can_shift]
+                next_time_steps = time_steps[can_shift, -1]
+                self._window_body_pos[can_shift, -1] = self.motion.sample(
+                    "body_pos_w", next_motion_ids, next_time_steps
+                )
+                self._window_body_quat[can_shift, -1] = self.motion.sample(
+                    "body_quat_w", next_motion_ids, next_time_steps
+                )
+            if torch.any(refresh):
+                refresh_motion_ids = motion_ids[refresh]
+                refresh_time_steps = time_steps[refresh]
+                self._window_body_pos[refresh] = self.motion.sample(
+                    "body_pos_w", refresh_motion_ids, refresh_time_steps
+                )
+                self._window_body_quat[refresh] = self.motion.sample(
+                    "body_quat_w", refresh_motion_ids, refresh_time_steps
+                )
+        self._window_time_steps = time_steps.clone()
+        self._window_motion_ids = self.motion_ids.clone()
+        return self._window_body_pos, self._window_body_quat
+
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self.motion.joint_pos[self.time_steps]
+        return self._motion_cache["joint_pos"]
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self.motion.joint_vel[self.time_steps]
+        return self._motion_cache["joint_vel"]
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.time_steps] + self._env.scene.env_origins[:, None, :]
+        return self._motion_cache["body_pos_w"] + self._env.scene.env_origins[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.time_steps]
+        return self._motion_cache["body_quat_w"]
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.time_steps]
+        return self._motion_cache["body_lin_vel_w"]
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.time_steps]
+        return self._motion_cache["body_ang_vel_w"]
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index] + self._env.scene.env_origins
+        return self._motion_cache["body_pos_w"][:, self.motion_anchor_body_index] + self._env.scene.env_origins
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.time_steps, self.motion_anchor_body_index]
+        return self._motion_cache["body_quat_w"][:, self.motion_anchor_body_index]
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.time_steps, self.motion_anchor_body_index]
+        return self._motion_cache["body_lin_vel_w"][:, self.motion_anchor_body_index]
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.time_steps, self.motion_anchor_body_index]
+        return self._motion_cache["body_ang_vel_w"][:, self.motion_anchor_body_index]
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
@@ -310,45 +545,66 @@ class MotionCommand(CommandTerm):
         self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
 
     def _adaptive_sampling(self, env_ids: Sequence[int]):
-        episode_failed = self._env.termination_manager.terminated[env_ids]
-        if torch.any(episode_failed):
-            current_bin_index = torch.clamp(
-                (self.time_steps * self.bin_count) // max(self.motion.time_step_total, 1), 0, self.bin_count - 1
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        previously_sampled = self._has_sampled[env_ids]
+        if torch.any(previously_sampled):
+            previous_env_ids = env_ids[previously_sampled]
+            previous_time_steps = torch.minimum(
+                self.time_steps[previous_env_ids], self.motion.time_totals[self.motion_ids[previous_env_ids]] - 1
             )
-            fail_bins = current_bin_index[env_ids][episode_failed]
-            self._current_bin_failed[:] = torch.bincount(fail_bins, minlength=self.bin_count)
+            previous_bins = self.motion_bin_offsets[self.motion_ids[previous_env_ids]] + torch.div(
+                previous_time_steps, self.cfg.adaptive_bin_size, rounding_mode="floor"
+            )
+            self._current_bin_episodes += torch.bincount(previous_bins, minlength=self.bin_count)
+            episode_failed = self._env.termination_manager.terminated[previous_env_ids]
+            if torch.any(episode_failed):
+                self._current_bin_failed += torch.bincount(
+                    previous_bins[episode_failed], minlength=self.bin_count
+                )
 
-        # Sample
-        sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
-        sampling_probabilities = torch.nn.functional.pad(
-            sampling_probabilities.unsqueeze(0).unsqueeze(0),
-            (0, self.cfg.adaptive_kernel_size - 1),  # Non-causal kernel
-            mode="replicate",
+        failure_rate = self.bin_failed_count / self.bin_episode_count.clamp_min(1.0)
+        weighted_failure_rate = failure_rate * self.bin_prior_weights
+        failure_probabilities = weighted_failure_rate / weighted_failure_rate.sum().clamp_min(1.0e-12)
+        uniform_probabilities = self.bin_prior_weights
+        sampling_probabilities = (
+            (1.0 - self.cfg.adaptive_uniform_ratio) * failure_probabilities
+            + self.cfg.adaptive_uniform_ratio * uniform_probabilities
         )
-        sampling_probabilities = torch.nn.functional.conv1d(sampling_probabilities, self.kernel.view(1, 1, -1)).view(-1)
-
-        sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
 
         sampled_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
-
-        self.time_steps[env_ids] = (
-            (sampled_bins + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device))
-            / self.bin_count
-            * (self.motion.time_step_total - 1)
+        self.motion_ids[env_ids] = self.bin_motion_ids[sampled_bins]
+        bin_lengths = self.bin_ends[sampled_bins] - self.bin_starts[sampled_bins]
+        self.time_steps[env_ids] = self.bin_starts[sampled_bins] + (
+            torch.rand(len(env_ids), device=self.device) * bin_lengths
         ).long()
+        self._has_sampled[env_ids] = True
 
         # Metrics
         H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
-        H_norm = H / math.log(self.bin_count)
+        H_norm = H / math.log(self.bin_count) if self.bin_count > 1 else torch.ones_like(H)
         pmax, imax = sampling_probabilities.max(dim=0)
         self.metrics["sampling_entropy"][:] = H_norm
         self.metrics["sampling_top1_prob"][:] = pmax
         self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
 
+    def _sync_adaptive_stats(self):
+        """Merge newly collected bin statistics, including across DDP ranks."""
+        episodes = self._current_bin_episodes
+        failures = self._current_bin_failed
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            packed = torch.cat((episodes, failures))
+            torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+            episodes, failures = packed.chunk(2)
+        self.bin_episode_count += episodes
+        self.bin_failed_count += failures * self.cfg.adaptive_failure_multiplier
+        self._current_bin_episodes.zero_()
+        self._current_bin_failed.zero_()
+
     def _resample_command(self, env_ids: Sequence[int]):
         if len(env_ids) == 0:
             return
         self._adaptive_sampling(env_ids)
+        self._refresh_motion_cache(torch.as_tensor(env_ids, dtype=torch.long, device=self.device))
 
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()
@@ -389,8 +645,14 @@ class MotionCommand(CommandTerm):
 
     def _update_command(self):
         self.time_steps += 1
-        env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
+        env_ids = torch.where(self.time_steps >= self.motion.time_totals[self.motion_ids])[0]
         self._resample_command(env_ids)
+        active_env_ids = torch.where(self.time_steps < self.motion.time_totals[self.motion_ids])[0]
+        if len(env_ids) > 0:
+            active_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            active_mask[env_ids] = False
+            active_env_ids = torch.where(active_mask)[0]
+        self._refresh_motion_cache(active_env_ids)
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
         anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -404,10 +666,9 @@ class MotionCommand(CommandTerm):
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
         self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
 
-        self.bin_failed_count = (
-            self.cfg.adaptive_alpha * self._current_bin_failed + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
-        )
-        self._current_bin_failed.zero_()
+        self._adaptive_sync_counter += 1
+        if self._adaptive_sync_counter % self.cfg.adaptive_sync_interval == 0:
+            self._sync_adaptive_stats()
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
@@ -468,6 +729,7 @@ class MotionCommandCfg(CommandTermCfg):
     asset_name: str = MISSING
 
     motion_file: str = MISSING
+    motion_data_device: str = "auto"
     anchor_body_name: str = MISSING
     body_names: list[str] = MISSING
 
@@ -480,6 +742,11 @@ class MotionCommandCfg(CommandTermCfg):
     adaptive_lambda: float = 0.8
     adaptive_uniform_ratio: float = 0.1
     adaptive_alpha: float = 0.001
+    adaptive_bin_size: int = 50
+    adaptive_prior_count: float = 1.0
+    adaptive_failure_multiplier: float = 1.0
+    adaptive_sync_interval: int = 200
+    adaptive_sequence_length_agnostic: bool = True
 
     anchor_visualizer_cfg: VisualizationMarkersCfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/Command/pose")
     anchor_visualizer_cfg.markers["frame"].scale = (0.2, 0.2, 0.2)

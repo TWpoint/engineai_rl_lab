@@ -141,8 +141,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         api = wandb.Api()
         artifact = api.artifact(registry_name)
         env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
-    else:
-        raise ValueError("Either --motion_file or --registry_name must be provided.")
+    elif not isinstance(env_cfg.commands.motion.motion_file, str):
+        raise ValueError("Provide --motion_file/--registry_name or configure commands.motion.motion_file in the task.")
 
     installed_rsl_rl_version = metadata.version("rsl-rl-lib")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_rsl_rl_version)

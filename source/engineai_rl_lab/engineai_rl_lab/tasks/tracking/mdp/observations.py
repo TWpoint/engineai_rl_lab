@@ -94,7 +94,9 @@ def _motion_time_steps(command: MotionCommand, frame_offsets: list[int] | tuple[
     if any(not isinstance(offset, int) for offset in frame_offsets):
         raise TypeError("frame_offsets must contain integers only")
     offsets = torch.tensor(frame_offsets, dtype=torch.long, device=command.device)
-    return (command.time_steps[:, None] + offsets[None, :]).clamp_(0, command.motion.time_step_total - 1)
+    time_steps = command.time_steps[:, None] + offsets[None, :]
+    motion_lengths = command.motion.time_totals[command.motion_ids, None]
+    return torch.minimum(torch.clamp_min(time_steps, 0), motion_lengths - 1)
 
 
 def motion_body_pos_b_window(
@@ -108,8 +110,8 @@ def motion_body_pos_b_window(
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     time_steps = _motion_time_steps(command, frame_offsets)
-    body_pos_w = command.motion.body_pos_w[time_steps] + env.scene.env_origins[:, None, None, :]
-    body_quat_w = command.motion.body_quat_w[time_steps]
+    body_pos_w, body_quat_w = command.sample_body_window(time_steps)
+    body_pos_w = body_pos_w + env.scene.env_origins[:, None, None, :]
     num_frames, num_bodies = time_steps.shape[1], len(command.cfg.body_names)
     pos_b, _ = subtract_frame_transforms(
         command.robot_anchor_pos_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
@@ -126,8 +128,8 @@ def motion_body_ori_b_window(
     """Reference body 6D orientations over a configurable past/future window."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     time_steps = _motion_time_steps(command, frame_offsets)
-    body_pos_w = command.motion.body_pos_w[time_steps] + env.scene.env_origins[:, None, None, :]
-    body_quat_w = command.motion.body_quat_w[time_steps]
+    body_pos_w, body_quat_w = command.sample_body_window(time_steps)
+    body_pos_w = body_pos_w + env.scene.env_origins[:, None, None, :]
     num_frames, num_bodies = time_steps.shape[1], len(command.cfg.body_names)
     _, ori_b = subtract_frame_transforms(
         command.robot_anchor_pos_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
@@ -150,8 +152,8 @@ def motion_body_pose_b_window_by_entity(
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     time_steps = _motion_time_steps(command, frame_offsets)
-    body_pos_w = command.motion.body_pos_w[time_steps] + env.scene.env_origins[:, None, None, :]
-    body_quat_w = command.motion.body_quat_w[time_steps]
+    body_pos_w, body_quat_w = command.sample_body_window(time_steps)
+    body_pos_w = body_pos_w + env.scene.env_origins[:, None, None, :]
     num_frames, num_bodies = time_steps.shape[1], len(command.cfg.body_names)
     pos_b, ori_b = subtract_frame_transforms(
         command.robot_anchor_pos_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
