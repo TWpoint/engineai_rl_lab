@@ -58,6 +58,35 @@ def robot_body_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     return mat[..., :2].reshape(mat.shape[0], -1)
 
 
+def motion_body_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Reference body positions expressed in the robot's current anchor frame."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    num_bodies = len(command.cfg.body_names)
+    pos_b, _ = subtract_frame_transforms(
+        command.robot_anchor_pos_w[:, None, :].repeat(1, num_bodies, 1),
+        command.robot_anchor_quat_w[:, None, :].repeat(1, num_bodies, 1),
+        command.body_pos_w,
+        command.body_quat_w,
+    )
+    return pos_b.reshape(env.num_envs, -1)
+
+
+def motion_body_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Reference body orientations expressed in the robot's current anchor frame as 6D rotations."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    num_bodies = len(command.cfg.body_names)
+    _, ori_b = subtract_frame_transforms(
+        command.robot_anchor_pos_w[:, None, :].repeat(1, num_bodies, 1),
+        command.robot_anchor_quat_w[:, None, :].repeat(1, num_bodies, 1),
+        command.body_pos_w,
+        command.body_quat_w,
+    )
+    mat = matrix_from_quat(ori_b)
+    return mat[..., :2].reshape(env.num_envs, -1)
+
+
 def motion_anchor_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
