@@ -67,6 +67,16 @@ gym.register(
 )
 
 gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v3-n1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v3:T800FlatWoStateEstimationEnvCfgV3",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v3:T800FlatV3N1PPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Tracking-Flat-T800-Low-Freq-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
