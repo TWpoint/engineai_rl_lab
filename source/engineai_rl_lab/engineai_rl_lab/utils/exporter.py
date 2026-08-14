@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import copy
+import math
 import os
 
 # import numpy as np
@@ -233,10 +234,103 @@ def list_to_csv_str(arr, *, decimals: int = 3, delimiter: str = ",") -> str:
     )
 
 
-def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filename="policy.onnx") -> None:
+def _group_cfg(env: ManagerBasedRLEnv, group_name: str):
+    return getattr(env.observation_manager.cfg, group_name)
+
+
+def _term_history_length(group_cfg, term_name: str) -> int:
+    """Return the effective history length for an observation term."""
+    if getattr(group_cfg, "history_length", None) is not None:
+        return max(1, int(group_cfg.history_length))
+    term_cfg = group_cfg.to_dict()[term_name]
+    return max(1, int(term_cfg.get("history_length") or 0))
+
+
+def _onnx_input_shapes(model: onnx.ModelProto) -> dict[str, list[int]]:
+    """Extract static ONNX input shapes, excluding initializer tensors."""
+    initializer_names = {initializer.name for initializer in model.graph.initializer}
+    shapes = {}
+    for value in model.graph.input:
+        if value.name in initializer_names:
+            continue
+        dims = []
+        for dim in value.type.tensor_type.shape.dim:
+            if not dim.HasField("dim_value"):
+                raise ValueError(f"ONNX input '{value.name}' has a dynamic shape; deployment requires static shapes.")
+            dims.append(int(dim.dim_value))
+        if not dims or dims[0] != 1:
+            raise ValueError(f"ONNX input '{value.name}' must have batch dimension 1, got {dims}.")
+        shapes[value.name] = dims[1:]
+    return shapes
+
+
+def _build_policy_inputs(env: ManagerBasedRLEnv, actor_obs_groups: list[str], model: onnx.ModelProto) -> list[dict]:
+    """Build schema-v2 named input descriptions for the actor observation groups."""
+    input_shapes = _onnx_input_shapes(model)
+    expected_input_names = ["obs"] if actor_obs_groups == ["policy"] else actor_obs_groups
+    if list(input_shapes) != expected_input_names:
+        raise ValueError(
+            "ONNX actor inputs do not match configured actor observation groups: "
+            f"expected {expected_input_names}, got {list(input_shapes)}."
+        )
+
+    policy_inputs = []
+    term_dims_by_group = getattr(env.observation_manager, "_group_obs_term_dim", {})
+    for group_name, tensor_name in zip(actor_obs_groups, expected_input_names, strict=True):
+        term_names = list(env.observation_manager.active_terms[group_name])
+        group_cfg = _group_cfg(env, group_name)
+        term_dims = term_dims_by_group.get(group_name)
+        if term_dims is None or len(term_dims) != len(term_names):
+            raise ValueError(f"Observation dimensions are unavailable for group '{group_name}'.")
+
+        history_length = max((_term_history_length(group_cfg, name) for name in term_names), default=1)
+        term_entries = []
+        for term_name, term_dim in zip(term_names, term_dims, strict=True):
+            term_size_with_history = math.prod(term_dim)
+            term_history_length = _term_history_length(group_cfg, term_name)
+            if term_history_length != history_length:
+                raise ValueError(
+                    f"Observation group '{group_name}' mixes history lengths: term '{term_name}' has "
+                    f"{term_history_length}, while the group deploy layout uses {history_length}. "
+                    "Split terms with different histories into separate actor observation groups."
+                )
+            if term_size_with_history % term_history_length != 0:
+                raise ValueError(
+                    f"Observation term '{group_name}.{term_name}' dimension {term_dim} is not divisible by "
+                    f"history length {term_history_length}."
+                )
+            term_entries.append({"name": term_name, "size": term_size_with_history // term_history_length})
+
+        shape = input_shapes[tensor_name]
+        if math.prod(shape) != sum(term["size"] * _term_history_length(group_cfg, term["name"]) for term in term_entries):
+            raise ValueError(
+                f"ONNX input '{tensor_name}' shape {shape} does not match observation group '{group_name}'."
+            )
+        policy_inputs.append(
+            {
+                "name": group_name,
+                "tensor_name": tensor_name,
+                "shape": shape,
+                "history_length": history_length,
+                "flatten_history_dim": bool(getattr(group_cfg, "flatten_history_dim", True)),
+                "history_order": "oldest_to_newest",
+                "terms": term_entries,
+            }
+        )
+    return policy_inputs
+
+
+def attach_onnx_metadata(
+    env: ManagerBasedRLEnv,
+    run_path: str,
+    path: str,
+    filename="policy.onnx",
+    actor_obs_groups: list[str] | None = None,
+) -> None:
     onnx_path = os.path.join(path, filename)
     robot = env.scene["robot"]
 
+    actor_obs_groups = actor_obs_groups or ["policy"]
     observation_names = env.observation_manager.active_terms["policy"]
     observation_history_lengths: list[int] = []
 
@@ -260,7 +354,9 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
     else:
         action_scale = [float(action_scale)] * len(robot.joint_names)
 
+    model = onnx.load(onnx_path)
     metadata = {
+        "schema_version": 2,
         # "run_path": run_path,
         "default_joint_pos": default_joint_pos_nominal.cpu().tolist(),
         "joint_names": robot.joint_names,
@@ -273,12 +369,14 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
         # "anchor_body_name": env.command_manager.get_term("motion").cfg.anchor_body_name,
         # "body_names": env.command_manager.get_term("motion").cfg.body_names,
     }
+    metadata["policy_inputs"] = _build_policy_inputs(env, list(actor_obs_groups), model)
 
     # 保存文件
     class CustomListDumper(yaml.SafeDumper):
         def represent_sequence(self, tag, sequence, flow_style=None):
-            # 如果是列表，使用流式风格
-            flow_style = True  # 强制使用流式风格 [item1, item2, ...]
+            # Keep legacy scalar arrays compact, but render schema-v2 object lists
+            # as readable YAML blocks.
+            flow_style = all(not isinstance(item, (dict, list)) for item in sequence)
 
             # 调用父类方法生成序列节点
             node = yaml.SafeDumper.represent_sequence(self, tag, sequence, flow_style=flow_style)
@@ -304,12 +402,17 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
             sort_keys=False,
             indent=2,
         )
-    model = onnx.load(onnx_path)
-
     for k, v in metadata.items():
         entry = onnx.StringStringEntryProto()
         entry.key = k
-        entry.value = list_to_csv_str(v) if isinstance(v, list) else str(v)
+        # Preserve the historic CSV encoding for flat arrays. Structured
+        # schema-v2 values use YAML so nested input descriptions are lossless.
+        if isinstance(v, list) and all(not isinstance(item, (dict, list)) for item in v):
+            entry.value = list_to_csv_str(v)
+        elif isinstance(v, (dict, list)):
+            entry.value = yaml.safe_dump(v, sort_keys=False).strip()
+        else:
+            entry.value = str(v)
         model.metadata_props.append(entry)
 
     onnx.save(model, onnx_path)

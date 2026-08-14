@@ -190,6 +190,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             path=export_model_dir,
             filename="policy.onnx",
         )
+        # Validate the exported actor inputs and write deployment metadata
+        # before converting the model. This prevents publishing an MNN model
+        # whose observation groups cannot be reproduced by the native SDK.
+        attach_onnx_metadata(
+            env.unwrapped,
+            args_cli.wandb_path if args_cli.wandb_path else "none",
+            export_model_dir,
+            actor_obs_groups=agent_cfg.obs_groups["actor"],
+        )
         # Convert the exported policy to MNN when the optional converter is installed.
         onnx_file = os.path.join(export_model_dir, "policy.onnx")
         mnn_file = os.path.join(export_model_dir, get_mnn_filename(resume_path, agent_cfg.run_name))
@@ -221,7 +230,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             print(f"ONNX file not found: {onnx_file}")
 
-        attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
         if args_cli.export_only:
             env.close()
             return

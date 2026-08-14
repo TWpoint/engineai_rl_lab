@@ -206,6 +206,11 @@ python scripts/tracking/play.py --task Tracking-Flat-T800-Wo-State-Estimation-v0
 - 将npz动作文件复制到`assets/config/xxx/rl_dance_example/trajectories`目录下
 - 修改`assets/config/xxx/rl_dance_example/default.yaml`文件内的`policy_file`、`trajectory_file_npz`的文件名
 
+对于多个 actor observation group 的策略（例如 T800 v2/v3/v4），`play.py` 还会生成
+`exported/deploy_config.yaml`。部署时应同时复制 `.mnn`、动作 `.npz` 和该配置内容；根据 SDK 中的目标目录修改
+`policy_file` 与 `trajectory_file_npz`，并为配置分配独立的 `param_tag`。不要把分组输入配置改写成旧版单一
+`observation_names` 向量，否则输入的时间维度和 tensor name 会丢失。
+
 > 请保证动作数据的第一帧和最后一帧的机器人关节位置和pd stand下的基本一致，这有利于切换策略(模式)时的动作流畅性。
 
 2. 运行仿真
@@ -228,7 +233,9 @@ engineai_robotics_env
 python3 tools/virtual_gamepad/virtual_gamepad.py
 ```
 
-`play.py` 会先导出 `exported/policy.onnx`，再调用 `MNN.tools.mnnconvert` 生成 `exported/policy.mnn`。如果只安装了最小依赖，脚本会提示缺少 MNN 并跳过第二步；部署前应使用上面的 `[export]` 安装方式，并确认两个文件都已生成。
+`play.py` 会先导出 `exported/policy.onnx` 和 `exported/deploy_config.yaml`，验证模型输入与训练 observation group
+一致后，再调用 `MNN.tools.mnnconvert` 生成 `exported/policy.mnn`。如果只安装了最小依赖，脚本会提示缺少 MNN
+并跳过第二步；部署前应使用上面的 `[export]` 安装方式，并确认三个文件都已生成。
 ![手柄控制界面](docs/gamepad.png)
 
 遥控器操作请参阅[engineai_robotics_native_sdk](https://github.com/engineai-robotics/engineai_robotics_native_sdk)中的键位。

@@ -189,6 +189,12 @@ Both simulation deployment and real-robot deployment depend on `engineai_robotic
 - Copy the NPZ motion file to the `assets/config/xxx/rl_dance_example/trajectories` directory.
 - Edit `policy_file` and `trajectory_file_npz` in `assets/config/xxx/rl_dance_example/default.yaml`.
 
+For policies with multiple actor observation groups, such as T800 v2/v3/v4, `play.py` also writes
+`exported/deploy_config.yaml`. Copy the `.mnn`, motion `.npz`, and deployment configuration together; adjust
+`policy_file` and `trajectory_file_npz` for the SDK target directory and assign the configuration a dedicated
+`param_tag`. Do not collapse grouped inputs into the legacy `observation_names` vector, because that loses tensor
+names and temporal layouts.
+
 > Please make sure that the robot joint positions in the first and last frames of the motion data are basically consistent with those in PD stand. This helps ensure smooth motion when switching policies or modes.
 
 2. Run the simulation:
@@ -211,7 +217,10 @@ engineai_robotics_env
 python3 tools/virtual_gamepad/virtual_gamepad.py
 ```
 
-`play.py` first writes `exported/policy.onnx`, then invokes `MNN.tools.mnnconvert` to produce `exported/policy.mnn`. With only the minimal dependencies it warns and skips the MNN step. Before deployment, install the `[export]` extra and verify that both files exist.
+`play.py` first writes `exported/policy.onnx` and `exported/deploy_config.yaml`, validates model inputs against the
+training observation groups, and then invokes `MNN.tools.mnnconvert` to produce `exported/policy.mnn`. With only the
+minimal dependencies it warns and skips the MNN step. Before deployment, install the `[export]` extra and verify that
+all three files exist.
 
 ![Gamepad control interface](docs/gamepad.png)
 
