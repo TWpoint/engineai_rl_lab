@@ -9,7 +9,7 @@ from isaaclab_rl.rsl_rl import (
 @configclass
 class T800FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 20000
+    max_iterations = None
     save_interval = 2000
     logger = "wandb"
     run_name = "baseline"
