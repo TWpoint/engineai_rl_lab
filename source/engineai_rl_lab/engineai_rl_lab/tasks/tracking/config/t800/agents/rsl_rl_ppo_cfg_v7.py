@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from isaaclab.utils.configclass import configclass
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg
 
@@ -146,3 +148,12 @@ class T800FlatV7PPORunnerCfg(T800FlatV6PPORunnerCfg):
         obs_normalization=False,
         distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0),
     )
+
+
+@configclass
+class T800FlatV7N1PPORunnerCfg(T800FlatV7PPORunnerCfg):
+    """V7 actor without the temporal self-attention FFN."""
+
+    run_name = "v7-n1"
+    actor = deepcopy(T800FlatV7PPORunnerCfg().actor)
+    actor.nodes["temporal_encoder"]["cell"]["use_ffn"] = False
