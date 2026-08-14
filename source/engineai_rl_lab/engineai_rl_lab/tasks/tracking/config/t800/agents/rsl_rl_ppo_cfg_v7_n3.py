@@ -7,7 +7,7 @@ from .rsl_rl_ppo_cfg_v7_n2 import T800FlatV7N2PPORunnerCfg
 
 @configclass
 class T800FlatV7N3PPORunnerCfg(T800FlatV7N2PPORunnerCfg):
-    """Width-scaled V7-N2 actor with nonlinear per-token input projections."""
+    """Width-scaled V7-N2 actor with FFN only in the final cross-attention."""
 
     run_name = "v7-n3"
     actor = deepcopy(T800FlatV7N2PPORunnerCfg().actor)
@@ -29,8 +29,12 @@ class T800FlatV7N3PPORunnerCfg(T800FlatV7N2PPORunnerCfg):
             {
                 "output_dim": 256,
                 "num_heads": 4,
-                "ffn_dim": 512,
             }
         )
+
+    for encoder_name in ("temporal_encoder", "command_self_attention"):
+        actor.nodes[encoder_name]["cell"]["use_ffn"] = False
+
+    actor.nodes["command_encoder"]["cell"]["ffn_dim"] = 512
 
     actor.nodes["action_decoder"]["cell"]["hidden_dims"] = [512, 256]
