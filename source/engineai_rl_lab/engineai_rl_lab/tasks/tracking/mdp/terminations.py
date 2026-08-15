@@ -51,6 +51,22 @@ def bad_motion_body_pos(
     return torch.any(error > threshold, dim=-1)
 
 
+def bad_global_motion_body_pos(
+    env: ManagerBasedRLEnv, command_name: str, threshold: float, body_names: list[str] | None = None
+) -> torch.Tensor:
+    """Terminate on absolute world-frame body-position error, matching ScaleTrack."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    error = torch.norm(command.body_pos_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes], dim=-1)
+    return torch.any(error > threshold, dim=-1)
+
+
+def motion_time_out(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Terminate after reaching the final frame of the sampled motion."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return command.time_steps >= command.motion.time_totals[command.motion_ids] - 1
+
+
 def bad_motion_body_pos_z_only(
     env: ManagerBasedRLEnv, command_name: str, threshold: float, body_names: list[str] | None = None
 ) -> torch.Tensor:

@@ -65,9 +65,7 @@ def resolve_motion_files(manifest: str | os.PathLike[str]) -> list[str]:
         direct_mapping = not manifest_keys.intersection(document)
         if direct_mapping:
             if not all(isinstance(name, str) and isinstance(value, str) for name, value in document.items()):
-                raise ValueError(
-                    f"Motion mapping {path} must contain string motion-name to file-path entries"
-                )
+                raise ValueError(f"Motion mapping {path} must contain string motion-name to file-path entries")
             file_entries = list(document.values())
             exclude_entries = []
         else:
@@ -109,8 +107,10 @@ def resolve_motion_files(manifest: str | os.PathLike[str]) -> list[str]:
     seen: set[Path] = set()
     for motion in motions:
         motion_path = motion.as_posix()
-        if motion in seen or motion_path in exact_exclusions or any(
-            fnmatch(motion_path, pattern) for pattern in glob_exclusions
+        if (
+            motion in seen
+            or motion_path in exact_exclusions
+            or any(fnmatch(motion_path, pattern) for pattern in glob_exclusions)
         ):
             continue
         if motion.suffix.lower() != ".npz":
@@ -565,30 +565,25 @@ class MotionCommand(CommandTerm):
             self._current_bin_episodes += torch.bincount(previous_bins, minlength=self.bin_count)
             episode_failed = self._env.termination_manager.terminated[previous_env_ids]
             if torch.any(episode_failed):
-                self._current_bin_failed += torch.bincount(
-                    previous_bins[episode_failed], minlength=self.bin_count
-                )
+                self._current_bin_failed += torch.bincount(previous_bins[episode_failed], minlength=self.bin_count)
 
         failure_rate = self.bin_failed_count / self.bin_episode_count.clamp_min(1.0)
         if self.cfg.adaptive_failure_rate_max_over_mean is not None:
-            failure_rate_upper_bound = (
-                failure_rate.mean() * self.cfg.adaptive_failure_rate_max_over_mean
-            )
+            failure_rate_upper_bound = failure_rate.mean() * self.cfg.adaptive_failure_rate_max_over_mean
             failure_rate = failure_rate.clamp(max=failure_rate_upper_bound)
         weighted_failure_rate = failure_rate * self.bin_prior_weights
         failure_probabilities = weighted_failure_rate / weighted_failure_rate.sum().clamp_min(1.0e-12)
         uniform_probabilities = self.bin_prior_weights
         sampling_probabilities = (
-            (1.0 - self.cfg.adaptive_uniform_ratio) * failure_probabilities
-            + self.cfg.adaptive_uniform_ratio * uniform_probabilities
-        )
+            1.0 - self.cfg.adaptive_uniform_ratio
+        ) * failure_probabilities + self.cfg.adaptive_uniform_ratio * uniform_probabilities
 
         sampled_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
         self.motion_ids[env_ids] = self.bin_motion_ids[sampled_bins]
         bin_lengths = self.bin_ends[sampled_bins] - self.bin_starts[sampled_bins]
-        sampled_time_steps = self.bin_starts[sampled_bins] + (
-            torch.rand(len(env_ids), device=self.device) * bin_lengths
-        ).long()
+        sampled_time_steps = (
+            self.bin_starts[sampled_bins] + (torch.rand(len(env_ids), device=self.device) * bin_lengths).long()
+        )
         if self.cfg.adaptive_pre_failure_sample_window > 0:
             pre_failure_offsets = torch.randint(
                 self.cfg.adaptive_pre_failure_sample_window,
@@ -666,7 +661,8 @@ class MotionCommand(CommandTerm):
     def _update_command(self):
         self.time_steps += 1
         env_ids = torch.where(self.time_steps >= self.motion.time_totals[self.motion_ids])[0]
-        self._resample_command(env_ids)
+        if self.cfg.resample_at_motion_end:
+            self._resample_command(env_ids)
         active_env_ids = torch.where(self.time_steps < self.motion.time_totals[self.motion_ids])[0]
         if len(env_ids) > 0:
             active_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
@@ -757,6 +753,10 @@ class MotionCommandCfg(CommandTermCfg):
     velocity_range: dict[str, tuple[float, float]] = {}
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
+
+    # When disabled, the environment is expected to terminate at the final
+    # motion frame instead of silently switching to another motion.
+    resample_at_motion_end: bool = True
 
     adaptive_kernel_size: int = 1
     adaptive_lambda: float = 0.8
