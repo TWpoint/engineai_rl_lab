@@ -17,12 +17,12 @@ class T800ScaleTrackRewardsCfg:
     motion_body_height = RewTerm(
         func=mdp.motion_global_anchor_height_error_exp,
         weight=0.5,
-        params={"command_name": "motion", "std": 0.3},
+        params={"command_name": "motion", "std": 0.45},
     )
     motion_body_pos = RewTerm(
         func=mdp.motion_global_body_position_error_exp,
         weight=1.0,
-        params={"command_name": "motion", "std": 0.3},
+        params={"command_name": "motion", "std": 0.45},
     )
     motion_body_rot = RewTerm(
         func=mdp.motion_global_body_orientation_error_exp,
@@ -39,7 +39,7 @@ class T800ScaleTrackRewardsCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.1)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.03)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
@@ -64,7 +64,7 @@ class T800ScaleTrackTerminationsCfg:
     )
     body_pos = DoneTerm(
         func=mdp.bad_global_motion_body_pos,
-        params={"command_name": "motion", "threshold": 0.5},
+        params={"command_name": "motion", "threshold": 0.6},
     )
 
 
