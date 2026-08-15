@@ -95,7 +95,7 @@ def _motion_time_steps(command: MotionCommand, frame_offsets: list[int] | tuple[
         raise TypeError("frame_offsets must contain integers only")
     offsets = torch.tensor(frame_offsets, dtype=torch.long, device=command.device)
     time_steps = command.time_steps[:, None] + offsets[None, :]
-    motion_lengths = command.motion.time_totals[command.motion_ids, None]
+    motion_lengths = command.motion_lengths[:, None]
     return torch.minimum(torch.clamp_min(time_steps, 0), motion_lengths - 1)
 
 

@@ -64,7 +64,7 @@ def bad_global_motion_body_pos(
 def motion_time_out(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """Terminate after reaching the final frame of the sampled motion."""
     command: MotionCommand = env.command_manager.get_term(command_name)
-    return command.time_steps >= command.motion.time_totals[command.motion_ids] - 1
+    return command.time_steps >= command.motion_lengths - 1
 
 
 def bad_motion_body_pos_z_only(

@@ -6,7 +6,10 @@
 """Script to train RL agent with RSL-RL."""
 
 import argparse
+import contextlib
 import importlib.metadata as metadata
+import math
+import pathlib
 import pickle
 import sys
 
@@ -34,7 +37,12 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--distributed", action="store_true", default=False, help="Run training with multiple GPUs.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--registry_name", type=str, default=None, help="The name of the wandb registry.")
-parser.add_argument("--motion_file", type=str, default=None, help="Path to a local motion .npz file.")
+parser.add_argument(
+    "--motion_file",
+    type=str,
+    default=None,
+    help="Path to a local motion .npz file or YAML motion manifest.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -78,6 +86,66 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def configure_rank_cpu_runtime() -> None:
+    """Partition host CPUs across local workers without requiring NUMA tools."""
+
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if not args_cli.distributed or local_world_size <= 1 or not hasattr(os, "sched_getaffinity"):
+        return
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if not 0 <= local_rank < local_world_size:
+        raise ValueError(f"Invalid LOCAL_RANK/LOCAL_WORLD_SIZE: {local_rank}/{local_world_size}")
+    available_cpus = sorted(os.sched_getaffinity(0))
+    if not available_cpus:
+        return
+
+    def _gpu_numa_node(gpu_index: int) -> int | None:
+        if gpu_index >= torch.cuda.device_count():
+            return None
+        try:
+            properties = torch.cuda.get_device_properties(gpu_index)
+            pci_address = f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:{properties.pci_device_id:02x}.0"
+            value = int(pathlib.Path("/sys/bus/pci/devices", pci_address, "numa_node").read_text().strip())
+        except (AttributeError, OSError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    rank_numa_nodes = [_gpu_numa_node(index) for index in range(local_world_size)]
+    rank_numa_node = rank_numa_nodes[local_rank]
+    node_cpus: list[int] = []
+    if rank_numa_node is not None:
+        try:
+            node_cpu_text = pathlib.Path(f"/sys/devices/system/node/node{rank_numa_node}/cpulist").read_text().strip()
+            for group in node_cpu_text.split(","):
+                bounds = [int(value) for value in group.split("-")]
+                node_cpus.extend(range(bounds[0], bounds[-1] + 1))
+        except (OSError, ValueError):
+            node_cpus = []
+        node_cpus = sorted(set(node_cpus).intersection(available_cpus))
+
+    if node_cpus:
+        peer_ranks = [index for index, node in enumerate(rank_numa_nodes) if node == rank_numa_node]
+        peer_index = peer_ranks.index(local_rank)
+        cores_per_rank = max(1, math.ceil(len(node_cpus) / len(peer_ranks)))
+        begin = peer_index * cores_per_rank
+        rank_cpus = node_cpus[begin : begin + cores_per_rank]
+    else:
+        cores_per_rank = max(1, math.ceil(len(available_cpus) / local_world_size))
+        begin = local_rank * cores_per_rank
+        rank_cpus = available_cpus[begin : begin + cores_per_rank]
+    if not rank_cpus:
+        rank_cpus = [available_cpus[local_rank % len(available_cpus)]]
+
+    if os.environ.get("ENGINEAI_RANK_CPU_AFFINITY", "1") != "0":
+        with contextlib.suppress(OSError):
+            os.sched_setaffinity(0, rank_cpus)
+    requested_threads = os.environ.get("ENGINEAI_TORCH_THREADS_PER_RANK")
+    thread_count = int(requested_threads) if requested_threads else len(rank_cpus)
+    torch.set_num_threads(max(1, min(thread_count, len(rank_cpus))))
+    with contextlib.suppress(RuntimeError):
+        torch.set_num_interop_threads(1)
+
+
 class FiniteResetRslRlVecEnvWrapper(RslRlVecEnvWrapper):
     """Keep terminal rewards finite after resetting a diverged physics state."""
 
@@ -114,6 +182,7 @@ def sanitize_rsl_rl_cfg(cfg: dict) -> dict:
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
+    configure_rank_cpu_runtime()
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -134,8 +203,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif registry_name is not None:
         if ":" not in registry_name:
             registry_name += ":latest"
-        import pathlib
-
         import wandb
 
         api = wandb.Api()
