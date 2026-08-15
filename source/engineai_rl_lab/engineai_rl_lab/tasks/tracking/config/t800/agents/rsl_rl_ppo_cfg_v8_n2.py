@@ -15,7 +15,7 @@ class RslRlSeparateLearningRatePpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
 _N2_ALGORITHM_CFG = T800FlatV8N1PPORunnerCfg().algorithm.to_dict()
 _N2_ALGORITHM_CFG.update(
     num_learning_epochs=2,
-    num_mini_batches=16,
+    num_mini_batches=32,
     learning_rate=5.0e-5,
     actor_learning_rate=5.0e-5,
     critic_learning_rate=5.0e-4,
@@ -26,7 +26,7 @@ _N2_ALGORITHM_CFG.update(
 class T800FlatV8N2PPORunnerCfg(T800FlatV8N1PPORunnerCfg):
     """V8-N1 network with smaller PPO mini-batches and separate actor/critic learning rates."""
 
-    num_steps_per_env = 24
+    num_steps_per_env = 64
     run_name = "v8-n2"
     algorithm = RslRlSeparateLearningRatePpoAlgorithmCfg(**_N2_ALGORITHM_CFG)
 
