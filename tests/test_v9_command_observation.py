@@ -103,6 +103,7 @@ def test_v9_scale_config_uses_asymmetric_window_and_stronger_action_rate_penalty
     assert env_cfg.commands.motion.motion_shard_across_ranks
     assert runner_cfg.run_name == "v9_scale_lafan"
     assert runner_cfg.num_steps_per_env == 64
+    assert runner_cfg.save_interval == 500
 
 
 def test_v9_actor_projects_162_dimensional_command_tokens() -> None:

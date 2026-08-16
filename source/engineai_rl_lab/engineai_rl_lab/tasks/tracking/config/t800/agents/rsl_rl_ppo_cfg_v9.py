@@ -8,6 +8,7 @@ class T800FlatV9PPORunnerCfg(T800FlatV8N2PPORunnerCfg):
     """V8-N2 policy and PPO settings for the V9 command observation."""
 
     run_name = "v9"
+    save_interval = 500
 
 
 @configclass
