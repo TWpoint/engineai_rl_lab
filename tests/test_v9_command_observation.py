@@ -6,8 +6,9 @@ import torch
 from engineai_rl_lab.tasks.tracking.config.t800.agents.rsl_rl_ppo_cfg_v9 import (
     T800FlatV9ScalePPORunnerCfg,
 )
-from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v7 import DEFAULT_FRAME_OFFSETS
+from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v8 import T800FlatWoStateEstimationEnvCfgV8Scale
 from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v9 import (
+    V9_FRAME_OFFSETS,
     T800FlatWoStateEstimationEnvCfgV9Scale,
 )
 from engineai_rl_lab.tasks.tracking.mdp.observations import (
@@ -87,13 +88,17 @@ def test_v9_current_frame_error_is_zero_position_and_identity_rotation() -> None
     torch.testing.assert_close(error[:, :, 1, 3:], identity_6d, atol=1.0e-6, rtol=0.0)
 
 
-def test_v9_scale_config_changes_only_command_observation_and_run_name() -> None:
+def test_v9_scale_config_uses_asymmetric_window_and_stronger_action_rate_penalty() -> None:
+    v8_env_cfg = T800FlatWoStateEstimationEnvCfgV8Scale()
     env_cfg = T800FlatWoStateEstimationEnvCfgV9Scale()
     runner_cfg = T800FlatV9ScalePPORunnerCfg()
 
     command_term = env_cfg.observations.command.link_pose_b
     assert command_term.func is motion_body_pose_and_error_b_window_by_entity
-    assert command_term.params["frame_offsets"] == DEFAULT_FRAME_OFFSETS
+    assert command_term.params["frame_offsets"] == [-3, -2, -1, 0, 1, 2, 3, 4, 5]
+    assert command_term.params["frame_offsets"] == V9_FRAME_OFFSETS
+    assert v8_env_cfg.rewards.action_rate_l2.weight == -0.03
+    assert env_cfg.rewards.action_rate_l2.weight == -0.075
     assert env_cfg.terminations.body_pos.params["threshold"] == 0.6
     assert env_cfg.commands.motion.motion_shard_across_ranks
     assert runner_cfg.run_name == "v9_scale_lafan"
