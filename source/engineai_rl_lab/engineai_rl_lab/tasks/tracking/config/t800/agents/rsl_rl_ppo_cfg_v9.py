@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from isaaclab.utils.configclass import configclass
 
 from .rsl_rl_ppo_cfg_v8_n2 import T800FlatV8N2PPORunnerCfg
@@ -5,10 +7,14 @@ from .rsl_rl_ppo_cfg_v8_n2 import T800FlatV8N2PPORunnerCfg
 
 @configclass
 class T800FlatV9PPORunnerCfg(T800FlatV8N2PPORunnerCfg):
-    """V8-N2 policy and PPO settings for the V9 command observation."""
+    """V8-N2 PPO settings with additional actor and critic capacity for V9."""
 
     run_name = "v9"
     save_interval = 500
+    actor = deepcopy(T800FlatV8N2PPORunnerCfg().actor)
+    actor.nodes["attention_blocks"]["cell"]["ffn_dim"] = 384
+    critic = deepcopy(T800FlatV8N2PPORunnerCfg().critic)
+    critic.hidden_dims = [1024, 512, 256]
 
 
 @configclass

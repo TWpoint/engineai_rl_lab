@@ -243,6 +243,32 @@ def test_single_chunk_preserves_each_motion_offset(tmp_path: Path) -> None:
     torch.testing.assert_close(sampled[:, 0], torch.tensor([20.0, 120.0, 220.0]))
 
 
+def test_sonic_working_set_preserves_replacement_sampled_duplicates(tmp_path: Path) -> None:
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"motion-{index}.npz"
+        _write_motion(path, 3, 100.0 * index)
+        paths.append(str(path))
+
+    collection = MotionCollection(
+        paths,
+        body_indexes=(0, 1),
+        device="cpu",
+        storage_device="cpu",
+        joint_names=JOINT_OUTPUT_ORDER,
+        body_names=BODY_OUTPUT_ORDER,
+        selected_global_ids=[1, 1, 0],
+        global_time_totals=[3, 3],
+        max_chunk_frames=9,
+    )
+
+    assert collection.global_ids.tolist() == [1, 1, 0]
+    assert collection.num_motions == 3
+    assert collection.is_distributed_shard
+    sampled = collection.sample("joint_pos", torch.tensor([0, 1, 2]), torch.zeros(3, dtype=torch.long))
+    torch.testing.assert_close(sampled[:, 0], torch.tensor([120.0, 120.0, 20.0]))
+
+
 def test_window_shape_and_parallel_loading_are_deterministic(tmp_path: Path) -> None:
     paths = []
     for index in range(6):
@@ -264,6 +290,8 @@ def test_window_shape_and_parallel_loading_are_deterministic(tmp_path: Path) -> 
     parallel = MotionCollection(paths, max_workers=3, **kwargs)
     assert sequential.names == parallel.names
     assert sequential.global_ids.tolist() == [1, 3, 5]
+    assert sequential.global_time_totals.tolist() == [3, 4, 5, 6, 7, 8]
+    torch.testing.assert_close(sequential.global_time_totals, parallel.global_time_totals)
     motion_ids = torch.tensor([[0, 0], [1, 2]])
     time_steps = torch.tensor([[0, 1], [2, 99]])
     sequential_samples = sequential.sample_many(("body_pos_w", "body_quat_w"), motion_ids, time_steps)

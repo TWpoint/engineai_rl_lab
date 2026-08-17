@@ -4,7 +4,6 @@ from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v7 import (
     T800FlatWoStateEstimationEnvCfgV7,
 )
 
-
 LAFAN_SCALE_MOTION_MANIFEST = "/mnt/data-1/lpz/t800_datasets/lafan_and_slow2x_v0.yaml"
 
 
@@ -15,5 +14,5 @@ class T800FlatWoStateEstimationEnvCfgV7Scale(T800FlatWoStateEstimationEnvCfgV7):
     def __post_init__(self):
         super().__post_init__()
         self.commands.motion.motion_file = LAFAN_SCALE_MOTION_MANIFEST
-        self.commands.motion.adaptive_failure_rate_max_over_mean = 200.0
-        self.commands.motion.adaptive_pre_failure_sample_window = 200
+        self.commands.motion.adp_samp_failure_rate_max_over_mean = 200.0
+        self.commands.motion.pre_failure_sample_window = 200

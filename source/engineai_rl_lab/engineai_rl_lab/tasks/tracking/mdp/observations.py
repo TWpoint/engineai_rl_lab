@@ -173,6 +173,15 @@ def _pose_by_entity(pos_b: torch.Tensor, ori_b: torch.Tensor) -> torch.Tensor:
     return pose_b.permute(0, 2, 1, 3).reshape(num_envs, num_bodies, num_frames * 9)
 
 
+def _pose_by_entity_xz(pos_b: torch.Tensor, ori_b: torch.Tensor) -> torch.Tensor:
+    """Pack poses with ScaleBFM's contiguous rotated-X/rotated-Z encoding."""
+    num_envs, num_frames, num_bodies = pos_b.shape[:3]
+    rotation = matrix_from_quat(ori_b)
+    ori_6d_b = torch.cat((rotation[..., :, 0], rotation[..., :, 2]), dim=-1)
+    pose_b = torch.cat((pos_b, ori_6d_b), dim=-1)
+    return pose_b.permute(0, 2, 1, 3).reshape(num_envs, num_bodies, num_frames * 9)
+
+
 def motion_body_pose_b_window_by_entity(
     env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
 ) -> torch.Tensor:
@@ -184,6 +193,27 @@ def motion_body_pose_b_window_by_entity(
     """
     _, _, _, _, pos_b, ori_b = _motion_body_pose_b_window_components(env, command_name, frame_offsets)
     return _pose_by_entity(pos_b, ori_b)
+
+
+def motion_body_pose_b_window_by_entity_xz(
+    env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
+) -> torch.Tensor:
+    """Reference body poses using the X/Z 6D rotation encoding from V9.
+
+    This is exactly the target-trajectory half of
+    :func:`motion_body_pose_and_error_b_window_by_entity`, without the
+    target-to-current error features.
+    """
+    _, _, _, _, pos_b, ori_b = _motion_body_pose_b_window_components(env, command_name, frame_offsets)
+    return _pose_by_entity_xz(pos_b, ori_b)
+
+
+def motion_body_pose_b_window_xz_flat(
+    env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
+) -> torch.Tensor:
+    """Flatten the target-only V9 trajectory command for an MLP actor."""
+    command = motion_body_pose_b_window_by_entity_xz(env, command_name, frame_offsets)
+    return command.flatten(start_dim=1)
 
 
 def motion_body_pose_and_error_b_window_by_entity(
@@ -203,7 +233,7 @@ def motion_body_pose_and_error_b_window_by_entity(
     command, num_frames, num_bodies, target_quat_w, target_pos_b, target_ori_b = _motion_body_pose_b_window_components(
         env, command_name, frame_offsets
     )
-    target_pose = _pose_by_entity(target_pos_b, target_ori_b)
+    target_pose = _pose_by_entity_xz(target_pos_b, target_ori_b)
 
     robot_pos_b, _ = subtract_frame_transforms(
         command.robot_anchor_pos_w[:, None, :].expand(-1, num_bodies, -1),
@@ -218,9 +248,17 @@ def motion_body_pose_and_error_b_window_by_entity(
     current_quat_inv_w = quat_conjugate(command.robot_body_quat_w)[:, None, :, :].expand(-1, num_frames, -1, -1)
     ori_error_w = quat_mul(target_quat_w, current_quat_inv_w)
     ori_error_b = quat_mul(quat_mul(anchor_quat_inv_w, ori_error_w), anchor_quat_w)
-    error_pose = _pose_by_entity(pos_error_b, ori_error_b)
+    error_pose = _pose_by_entity_xz(pos_error_b, ori_error_b)
 
     return torch.cat((target_pose, error_pose), dim=-1)
+
+
+def motion_body_pose_and_error_b_window_flat(
+    env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
+) -> torch.Tensor:
+    """Flatten the V9 entity/trajectory command into one feature vector per environment."""
+    command = motion_body_pose_and_error_b_window_by_entity(env, command_name, frame_offsets)
+    return command.flatten(start_dim=1)
 
 
 def motion_anchor_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

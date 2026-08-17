@@ -7,6 +7,10 @@
 # Omniverse
 **/*.dmp
 **/.thumbs
+/imgui.ini
+
+# Syncthing file versioning
+/.stversions/
 
 # No USD files allowed in the repo
 # **/*.usd

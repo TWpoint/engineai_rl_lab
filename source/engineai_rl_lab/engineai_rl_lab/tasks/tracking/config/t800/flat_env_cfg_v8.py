@@ -88,10 +88,8 @@ class T800FlatWoStateEstimationEnvCfgV8Scale(T800FlatWoStateEstimationEnvCfgV8):
     def __post_init__(self):
         super().__post_init__()
         self.commands.motion.motion_file = LAFAN_SCALE_MOTION_MANIFEST
-        self.commands.motion.motion_shard_across_ranks = True
         self.commands.motion.motion_load_workers = 4
-        # At the intended 32-rank t800_v0 scale this normally keeps each
-        # worker's ~2.2M frames in one contiguous in-memory chunk.
+        # Keep each SONIC-style working set in one contiguous in-memory chunk.
         self.commands.motion.motion_chunk_frames = 8_388_608
-        self.commands.motion.adaptive_failure_rate_max_over_mean = 200.0
-        self.commands.motion.adaptive_pre_failure_sample_window = 200
+        self.commands.motion.adp_samp_failure_rate_max_over_mean = 200.0
+        self.commands.motion.pre_failure_sample_window = 200

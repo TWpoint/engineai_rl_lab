@@ -140,6 +140,38 @@ def shard_motion_files(motion_files: Sequence[str], *, world_size: int, rank: in
     return [motion_files[index] for index in global_ids], global_ids
 
 
+def read_motion_length(path: str | os.PathLike[str]) -> int:
+    """Read a motion frame count from its NPZ header without decoding its arrays."""
+
+    with zipfile.ZipFile(path) as archive:
+        try:
+            stream = archive.open("joint_pos.npy")
+        except KeyError as exc:
+            raise ValueError(f"Motion file {os.fspath(path)!r} is missing field 'joint_pos'") from exc
+        with stream:
+            version = np.lib.format.read_magic(stream)
+            if version == (1, 0):
+                shape, _, _ = np.lib.format.read_array_header_1_0(stream)
+            elif version == (2, 0):
+                shape, _, _ = np.lib.format.read_array_header_2_0(stream)
+            else:
+                raise ValueError(f"Motion file {os.fspath(path)!r} uses unsupported NPY header version {version}")
+    if len(shape) != 2 or shape[0] < 2:
+        raise ValueError(f"Motion file {os.fspath(path)!r} has invalid joint_pos shape {shape}")
+    return int(shape[0])
+
+
+def read_motion_lengths(motion_files: Sequence[str], *, max_workers: int = 4) -> list[int]:
+    """Read the complete manifest's frame counts in deterministic order."""
+
+    if max_workers <= 0:
+        raise ValueError("max_workers must be positive")
+    if max_workers == 1:
+        return [read_motion_length(path) for path in motion_files]
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="motion-header") as executor:
+        return list(executor.map(read_motion_length, motion_files))
+
+
 @dataclass(frozen=True)
 class MotionShardSelection:
     files: tuple[str, ...]
@@ -358,6 +390,8 @@ class MotionCollection:
         world_size: int | None = None,
         rank: int | None = None,
         shard_by_rank: bool = True,
+        selected_global_ids: Sequence[int] | None = None,
+        global_time_totals: Sequence[int] | torch.Tensor | None = None,
         max_chunk_frames: int = 262_144,
         max_workers: int | None = None,
     ):
@@ -373,12 +407,37 @@ class MotionCollection:
             int.from_bytes(manifest_digest.digest()[offset : offset + 8], byteorder="little", signed=True)
             for offset in range(0, manifest_digest.digest_size, 8)
         )
-        selection = select_motion_shard(
-            motion_files,
-            shard_by_rank=shard_by_rank,
-            world_size=world_size,
-            rank=rank,
-        )
+        if selected_global_ids is None:
+            selection = select_motion_shard(
+                motion_files,
+                shard_by_rank=shard_by_rank,
+                world_size=world_size,
+                rank=rank,
+            )
+        else:
+            if (world_size is None) != (rank is None):
+                raise ValueError("world_size and rank must be provided together")
+            if world_size is None:
+                world_size = int(os.environ.get("WORLD_SIZE", "1"))
+                rank = int(os.environ.get("RANK", "0"))
+            assert rank is not None
+            selected_global_ids = [int(global_id) for global_id in selected_global_ids]
+            if not selected_global_ids:
+                raise ValueError("selected_global_ids must not be empty")
+            invalid_ids = [global_id for global_id in selected_global_ids if not 0 <= global_id < len(motion_files)]
+            if invalid_ids:
+                raise ValueError(f"selected_global_ids contains invalid indices: {invalid_ids[:8]}")
+            selection = MotionShardSelection(
+                files=tuple(motion_files[global_id] for global_id in selected_global_ids),
+                global_ids=tuple(selected_global_ids),
+                global_num_motions=len(motion_files),
+                rank=rank,
+                world_size=world_size,
+                is_distributed_shard=(
+                    len(selected_global_ids) != len(motion_files)
+                    or len(set(selected_global_ids)) != len(selected_global_ids)
+                ),
+            )
         self.device = torch.device(device)
         self.storage_device = torch.device(storage_device)
         self.global_num_motions = selection.global_num_motions
@@ -392,6 +451,18 @@ class MotionCollection:
             raise ValueError("max_workers must be positive")
         # CUDA allocations and copies must stay on the constructing thread.
         self.max_workers = 1 if self.storage_device.type != "cpu" else int(max_workers)
+        if global_time_totals is None:
+            resolved_global_time_totals = read_motion_lengths(motion_files, max_workers=self.max_workers)
+        elif isinstance(global_time_totals, torch.Tensor):
+            resolved_global_time_totals = [int(value) for value in global_time_totals.tolist()]
+        else:
+            resolved_global_time_totals = [int(value) for value in global_time_totals]
+        if len(resolved_global_time_totals) != len(motion_files):
+            raise ValueError(
+                "global_time_totals must contain one length per manifest motion: "
+                f"{len(resolved_global_time_totals)} != {len(motion_files)}"
+            )
+        self.global_time_totals = torch.tensor(resolved_global_time_totals, dtype=torch.long, device=self.device)
 
         self.names: list[str] = []
         global_ids: list[int] = []
@@ -407,7 +478,7 @@ class MotionCollection:
         self.resident_bytes = 0
 
         entries = list(zip(selection.files, selection.global_ids, strict=True))
-        planned_lengths = list(self._iter_motion_lengths(entries))
+        planned_lengths = [resolved_global_time_totals[global_id] for global_id in selection.global_ids]
         planned_chunk_frames = self._plan_chunk_frames(planned_lengths)
         loader_iterator = iter(
             self._iter_loaders(
@@ -503,44 +574,6 @@ class MotionCollection:
                 except StopIteration:
                     continue
                 inflight.append((next_path, next_global_id, executor.submit(_load, next_path)))
-
-    def _iter_motion_lengths(self, entries: Sequence[tuple[str, int]]) -> Iterator[int]:
-        def _read(path: str) -> int:
-            with zipfile.ZipFile(path) as archive:
-                try:
-                    stream = archive.open("joint_pos.npy")
-                except KeyError as exc:
-                    raise ValueError(f"Motion file {path!r} is missing field 'joint_pos'") from exc
-                with stream:
-                    version = np.lib.format.read_magic(stream)
-                    if version == (1, 0):
-                        shape, _, _ = np.lib.format.read_array_header_1_0(stream)
-                    elif version == (2, 0):
-                        shape, _, _ = np.lib.format.read_array_header_2_0(stream)
-                    else:
-                        raise ValueError(f"Motion file {path!r} uses unsupported NPY header version {version}")
-            if len(shape) != 2 or shape[0] < 2:
-                raise ValueError(f"Motion file {path!r} has invalid joint_pos shape {shape}")
-            return int(shape[0])
-
-        if self.max_workers == 1:
-            for path, _ in entries:
-                yield _read(path)
-            return
-
-        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="motion-header") as executor:
-            iterator = iter(entries)
-            inflight: deque[Future[int]] = deque()
-            for _ in range(min(2 * self.max_workers, len(entries))):
-                path, _ = next(iterator)
-                inflight.append(executor.submit(_read, path))
-            while inflight:
-                yield inflight.popleft().result()
-                try:
-                    next_path, _ = next(iterator)
-                except StopIteration:
-                    continue
-                inflight.append(executor.submit(_read, next_path))
 
     def _plan_chunk_frames(self, motion_lengths: Sequence[int]) -> list[int]:
         chunk_frames: list[int] = []

@@ -152,9 +152,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v7_scale:T800FlatWoStateEstimationEnvCfgV7Scale",
-        "rsl_rl_cfg_entry_point": (
-            f"{agents.__name__}.rsl_rl_ppo_cfg_v7_n2_scale:T800FlatV7N2ScalePPORunnerCfg"
-        ),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.rsl_rl_ppo_cfg_v7_n2_scale:T800FlatV7N2ScalePPORunnerCfg"),
     },
 )
 
@@ -164,9 +162,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v7_scale:T800FlatWoStateEstimationEnvCfgV7Scale",
-        "rsl_rl_cfg_entry_point": (
-            f"{agents.__name__}.rsl_rl_ppo_cfg_v7_n3_scale:T800FlatV7N3ScalePPORunnerCfg"
-        ),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.rsl_rl_ppo_cfg_v7_n3_scale:T800FlatV7N3ScalePPORunnerCfg"),
     },
 )
 
@@ -206,9 +202,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v8:T800FlatWoStateEstimationEnvCfgV8Scale",
-        "rsl_rl_cfg_entry_point": (
-            f"{agents.__name__}.rsl_rl_ppo_cfg_v8_n1:T800FlatV8N1ScalePPORunnerCfg"
-        ),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.rsl_rl_ppo_cfg_v8_n1:T800FlatV8N1ScalePPORunnerCfg"),
     },
 )
 
@@ -228,9 +222,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v8:T800FlatWoStateEstimationEnvCfgV8Scale",
-        "rsl_rl_cfg_entry_point": (
-            f"{agents.__name__}.rsl_rl_ppo_cfg_v8_n2:T800FlatV8N2ScalePPORunnerCfg"
-        ),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.rsl_rl_ppo_cfg_v8_n2:T800FlatV8N2ScalePPORunnerCfg"),
     },
 )
 
@@ -251,6 +243,56 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v9:T800FlatWoStateEstimationEnvCfgV9Scale",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v9:T800FlatV9ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v9-n1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v9_n1:T800FlatWoStateEstimationEnvCfgV9N1",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v9_n1:T800FlatV9N1PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v10",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v10:T800FlatWoStateEstimationEnvCfgV10",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v10:T800FlatV10PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v11",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v11:T800FlatWoStateEstimationEnvCfgV11",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v11:T800FlatV11PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v11-n1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v11_n1:T800FlatWoStateEstimationEnvCfgV11N1",
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.rsl_rl_ppo_cfg_v11_n1:T800FlatV11N1PPORunnerCfg"),
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v11-n1-scale-lafan",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (f"{__name__}.flat_env_cfg_v11_n1:T800FlatWoStateEstimationEnvCfgV11N1ScaleLafan"),
+        "rsl_rl_cfg_entry_point": (f"{agents.__name__}.rsl_rl_ppo_cfg_v11_n1:T800FlatV11N1ScaleLafanPPORunnerCfg"),
     },
 )
 

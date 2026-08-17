@@ -6,9 +6,12 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoAlgorithmCfg,
 )
 
+
 @configclass
 class T800FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
+    sync_adaptive_sampling_all_gpus_freq = 200
+    motion_resample_frequency = 250
     max_iterations = None
     save_interval = 2000
     logger = "wandb"

@@ -30,6 +30,12 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
 parser.add_argument("--export_only", action="store_true", default=False, help="Export the policy and exit.")
+parser.add_argument(
+    "--follow_camera",
+    action="store_true",
+    default=False,
+    help="Continuously move the visualizer camera to follow the robot root.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append simulation launcher and backend-preset arguments
@@ -193,17 +199,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Validate the exported actor inputs and write deployment metadata
         # before converting the model. This prevents publishing an MNN model
         # whose observation groups cannot be reproduced by the native SDK.
-        attach_onnx_metadata(
-            env.unwrapped,
-            args_cli.wandb_path if args_cli.wandb_path else "none",
-            export_model_dir,
-            actor_obs_groups=agent_cfg.obs_groups["actor"],
-        )
+        deploy_export_valid = True
+        try:
+            attach_onnx_metadata(
+                env.unwrapped,
+                args_cli.wandb_path if args_cli.wandb_path else "none",
+                export_model_dir,
+                actor_obs_groups=agent_cfg.obs_groups["actor"],
+            )
+        except ValueError as err:
+            # Export is ancillary to interactive playback.  In particular, a
+            # flat MLP may concatenate several actor observation groups into a
+            # single ONNX ``obs`` tensor, which schema-v2 deployment metadata
+            # cannot currently describe without losing the group boundaries.
+            # Do not publish/convert that model, but still allow the loaded
+            # checkpoint to be evaluated in simulation.
+            if args_cli.export_only:
+                raise
+            deploy_export_valid = False
+            print(f"[WARN] Deployment export validation failed: {err}")
+            print("[WARN] Skipping MNN conversion and continuing interactive playback.")
         # Convert the exported policy to MNN when the optional converter is installed.
         onnx_file = os.path.join(export_model_dir, "policy.onnx")
         mnn_file = os.path.join(export_model_dir, get_mnn_filename(resume_path, agent_cfg.run_name))
 
-        if os.path.exists(onnx_file):
+        if os.path.exists(onnx_file) and deploy_export_valid:
             if importlib.util.find_spec("MNN") is None:
                 print("[WARN] MNN is not installed in the current Python environment. Skipping MNN conversion.")
             else:
@@ -227,7 +247,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print(f"Successfully converted to MNN: {mnn_file}")
                 except subprocess.CalledProcessError as err:
                     print(f"[WARN] Failed to convert ONNX to MNN: {err}")
-        else:
+        elif not os.path.exists(onnx_file):
             print(f"ONNX file not found: {onnx_file}")
 
         if args_cli.export_only:
@@ -243,6 +263,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     obs, _, dones, _ = env.step(actions)
                     if hasattr(policy, "reset"):
                         policy.reset(dones)
+                if args_cli.follow_camera:
+                    robot_root_pos = env.unwrapped.scene["robot"].data.root_pos_w.torch[0]
+                    camera_lookat = robot_root_pos.detach().cpu().numpy()
+                    env.unwrapped.sim.set_camera_view(camera_lookat + [2.0, 2.0, 0.5], camera_lookat)
                 if args_cli.video:
                     timestep += 1
                     if timestep >= args_cli.video_length:

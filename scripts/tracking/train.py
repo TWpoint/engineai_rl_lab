@@ -43,6 +43,12 @@ parser.add_argument(
     default=None,
     help="Path to a local motion .npz file or YAML motion manifest.",
 )
+parser.add_argument(
+    "--overfit_single_motion",
+    action="store_true",
+    default=False,
+    help="Disable randomization and sampling adaptation to overfit one --motion_file .npz trajectory.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -210,6 +216,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
     elif not isinstance(env_cfg.commands.motion.motion_file, str):
         raise ValueError("Provide --motion_file/--registry_name or configure commands.motion.motion_file in the task.")
+
+    if args_cli.overfit_single_motion:
+        if args_cli.motion_file is None or pathlib.Path(args_cli.motion_file).suffix.lower() != ".npz":
+            raise ValueError("--overfit_single_motion requires one local .npz file via --motion_file")
+        configure_overfit = getattr(env_cfg, "enable_single_motion_overfit", None)
+        if configure_overfit is None:
+            raise ValueError(f"Task {args_cli.task!r} does not provide a single-motion overfit configuration")
+        configure_overfit()
+        agent_cfg.run_name = f"{agent_cfg.run_name}_single_motion_overfit"
+        print("[INFO]: Single-motion overfit mode enabled (randomization, noise, and adaptive sampling disabled).")
 
     installed_rsl_rl_version = metadata.version("rsl-rl-lib")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_rsl_rl_version)
