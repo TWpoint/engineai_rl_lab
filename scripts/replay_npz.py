@@ -5,6 +5,7 @@
     # Usage
     python scripts/replay_npz.py --robot pm01 --input_file <path_to_motion.npz>
     python scripts/replay_npz.py --robot t800 --input_file <path_to_motion.npz>
+    python scripts/replay_npz.py --robot t800 --visualize_body_poses --input_file <path_to_motion.npz>
     python scripts/replay_npz.py --robot t800 --visualize_key_body_poses --input_file <path_to_motion.npz>
 """
 
@@ -23,10 +24,21 @@ parser = argparse.ArgumentParser(description="Replay converted motions.")
 parser.add_argument("--registry_name", type=str, default=None, help="The name of the wandb registry.")
 parser.add_argument("--input_file", type=str, default=None, help="Path to a local .npz motion file.")
 parser.add_argument("--robot", type=str, default="pm01", choices=["pm01", "t800"], help="Robot type to use.")
-parser.add_argument(
+pose_visualization_group = parser.add_mutually_exclusive_group()
+pose_visualization_group.add_argument(
+    "--visualize_body_poses",
+    action="store_true",
+    help="Visualize the position and orientation of every robot body stored in the NPZ.",
+)
+pose_visualization_group.add_argument(
     "--visualize_key_body_poses",
     action="store_true",
     help="Visualize key-body positions and orientations stored in the NPZ as coordinate frames.",
+)
+parser.add_argument(
+    "--follow_camera",
+    action="store_true",
+    help="Continuously move the camera to follow the robot root. By default the camera remains user-controlled.",
 )
 parser.add_argument(
     "--physics",
@@ -142,6 +154,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         key_body_visualizer_cfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/KeyBodyPoses")
         key_body_visualizer_cfg.markers["frame"].scale = (0.12, 0.12, 0.12)
         key_body_visualizer = VisualizationMarkers(key_body_visualizer_cfg)
+
+    body_visualizer = None
+    if args_cli.visualize_body_poses:
+        body_visualizer_cfg = FRAME_MARKER_CFG.replace(prim_path="/Visuals/BodyPoses")
+        body_visualizer_cfg.markers["frame"].scale = (0.12, 0.12, 0.12)
+        body_visualizer = VisualizationMarkers(body_visualizer_cfg)
     playback_fps = float(np.asarray(motion.fps).reshape(-1)[0])
     if playback_fps <= 0.0:
         raise ValueError(f"Motion FPS must be positive, got {playback_fps}.")
@@ -152,6 +170,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     print(f"[INFO]: Replaying {len(robot.joint_names)} joints and {len(robot.body_names)} bodies by name.")
     if key_body_names is not None:
         print(f"[INFO]: Visualizing {len(key_body_names)} key-body pose frames: {key_body_names}")
+    if body_visualizer is not None:
+        print(f"[INFO]: Visualizing {len(robot.body_names)} body pose frames: {robot.body_names}")
     print(f"[INFO]: Playback rate: {playback_fps:g} Hz ({frame_period * 1000.0:.2f} ms per frame).")
 
     # Simulation loop
@@ -184,8 +204,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             marker_orientations = key_body_quat_w[time_steps[0]]
             key_body_visualizer.visualize(marker_positions, marker_orientations)
 
-        pos_lookat = root_pose[0, :3].cpu().numpy()
-        sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
+        if body_visualizer is not None:
+            marker_positions = motion.body_pos_w[time_steps[0]] + scene.env_origins[0]
+            marker_orientations = motion.body_quat_w[time_steps[0]]
+            body_visualizer.visualize(marker_positions, marker_orientations)
+
+        if args_cli.follow_camera:
+            pos_lookat = root_pose[0, :3].cpu().numpy()
+            sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
 
         # Pace motion frames against wall-clock time. If rendering takes longer
         # than one frame period, rebase the deadline to avoid a catch-up burst.
