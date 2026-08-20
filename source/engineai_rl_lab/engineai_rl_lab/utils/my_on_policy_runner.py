@@ -75,6 +75,12 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         frequency = int(self.cfg.get("motion_resample_frequency", 250))
         if frequency <= 0 or (iteration + 1) % frequency != 0:
             return obs
+        if self.cfg.get("stagger_motion_working_set_refresh", False):
+            local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
+            local_rank = int(getattr(self, "gpu_local_rank", os.getenv("LOCAL_RANK", "0")))
+            refresh_event = (iteration + 1) // frequency - 1
+            if local_rank != refresh_event % local_world_size:
+                return obs
         command = self._motion_command()
         if command is None or not hasattr(command, "resample_motion_working_set"):
             return obs

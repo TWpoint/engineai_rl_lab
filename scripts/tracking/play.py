@@ -31,10 +31,46 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to the motion file.")
 parser.add_argument("--export_only", action="store_true", default=False, help="Export the policy and exit.")
 parser.add_argument(
+    "--latent_output", type=str, default=None, help="Save one rollout's policy latents to this NPZ file."
+)
+parser.add_argument(
+    "--latent_node",
+    type=str,
+    default="attention_blocks",
+    help="Actor graph node to capture (default: attention_blocks).",
+)
+parser.add_argument(
+    "--max_steps", type=int, default=None, help="Stop playback/latent collection after this many steps."
+)
+parser.add_argument(
     "--follow_camera",
     action="store_true",
     default=False,
     help="Continuously move the visualizer camera to follow the robot root.",
+)
+parser.add_argument(
+    "--start_at_motion_beginning",
+    action="store_true",
+    default=False,
+    help="Start every playback episode at frame zero instead of sampling a random motion time.",
+)
+parser.add_argument(
+    "--ghost_reference",
+    action="store_true",
+    default=False,
+    help="Overlay a collision-free translucent robot driven by the aligned reference motion.",
+)
+parser.add_argument(
+    "--ghost_opacity",
+    type=float,
+    default=0.3,
+    help="Opacity of the reference robot (default: 0.3).",
+)
+parser.add_argument(
+    "--ghost_offset",
+    type=float,
+    default=1.0,
+    help="Lateral distance in meters between the policy and reference robots (default: 1.0).",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -57,6 +93,7 @@ from engineai_rl_lab.utils.exporter import (
 )
 from rsl_rl.runners import OnPolicyRunner
 
+import isaaclab.sim as sim_utils
 from isaaclab.app import launch_simulation
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -65,6 +102,7 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.utils.math import quat_apply, yaw_quat
 
 from isaaclab_rl.entrypoints.common import apply_video_recording, pre_launch_video_config
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
@@ -105,12 +143,37 @@ def get_mnn_filename(resume_path: str, run_name: str | None) -> str:
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point", play_mode=True)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+def main(  # noqa: C901
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlOnPolicyRunnerCfg,
+):
     """Play with RSL-RL agent."""
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
+    if args_cli.start_at_motion_beginning:
+        env_cfg.commands.motion.start_at_motion_beginning = True
+        print("[INFO]: Starting every playback episode at the beginning of the motion.")
+    if args_cli.ghost_reference:
+        if not 0.0 < args_cli.ghost_opacity <= 1.0:
+            raise ValueError("--ghost_opacity must be in the interval (0, 1].")
+        if args_cli.ghost_offset < 0.0:
+            raise ValueError("--ghost_offset must be non-negative.")
+        ghost_cfg = env_cfg.scene.robot.replace(prim_path="{ENV_REGEX_NS}/GhostReference")
+        ghost_cfg.spawn = ghost_cfg.spawn.replace(
+            activate_contact_sensors=False,
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.15, 0.65, 1.0),
+                emissive_color=(0.02, 0.08, 0.12),
+                roughness=0.35,
+                opacity=args_cli.ghost_opacity,
+            ),
+            make_uninstanceable=True,
+        )
+        env_cfg.scene.ghost_reference = ghost_cfg
+        print(f"[INFO]: Enabling aligned reference robot (opacity={args_cli.ghost_opacity:g}).")
 
     installed_rsl_rl_version = metadata.version("rsl-rl-lib")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_rsl_rl_version)
@@ -186,6 +249,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # obtain the trained policy for inference
         policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
+        latent_samples = []
+        latent_hook = None
+        if args_cli.latent_output:
+            actor = ppo_runner.alg.get_policy()
+            if not hasattr(actor, "nodes") or args_cli.latent_node not in actor.nodes:
+                available = list(getattr(actor, "nodes", {}).keys())
+                raise ValueError(f"Actor node '{args_cli.latent_node}' not found; available nodes: {available}")
+
+            def capture_latent(_module, _inputs, output):
+                tensor = output[0] if isinstance(output, (tuple, list)) else output
+                latent_samples.append(tensor[0].detach().float().cpu().reshape(-1).numpy())
+
+            latent_hook = actor.nodes[args_cli.latent_node].register_forward_hook(capture_latent)
+            print(f"[INFO]: Capturing latent node '{args_cli.latent_node}' to: {args_cli.latent_output}")
+
         # export policy to ONNX
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
@@ -255,12 +333,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             return
 
         obs = env.get_observations()
+        ghost_robot = None
+        motion_command = None
+        if args_cli.ghost_reference:
+            ghost_robot = env.unwrapped.scene["ghost_reference"]
+            motion_command = env.unwrapped.command_manager.get_term("motion")
+            if ghost_robot.joint_names != motion_command.robot.joint_names:
+                raise RuntimeError("Reference robot joint ordering does not match the policy robot.")
+
+        def update_ghost_reference():
+            if ghost_robot is None or motion_command is None:
+                return
+            anchor_index = motion_command.motion_anchor_body_index
+            root_pose = torch.cat(
+                (
+                    motion_command.body_pos_relative_w[:, anchor_index],
+                    motion_command.body_quat_relative_w[:, anchor_index],
+                ),
+                dim=-1,
+            )
+            lateral_offset = torch.zeros_like(root_pose[:, :3])
+            lateral_offset[:, 1] = args_cli.ghost_offset
+            root_pose[:, :3] += quat_apply(yaw_quat(motion_command.robot_anchor_quat_w), lateral_offset)
+            ghost_robot.write_root_pose_to_sim_index(root_pose=root_pose)
+            ghost_robot.write_root_velocity_to_sim_index(
+                root_velocity=torch.zeros((root_pose.shape[0], 6), device=root_pose.device)
+            )
+            ghost_robot.write_joint_state_to_sim_index(
+                position=motion_command.joint_pos,
+                velocity=torch.zeros_like(motion_command.joint_vel),
+            )
+
+        update_ghost_reference()
         timestep = 0
         try:
             while env.unwrapped.sim.is_headless_or_exist_active_visualizer():
                 with torch.inference_mode():
                     actions = policy(obs)
                     obs, _, dones, _ = env.step(actions)
+                    update_ghost_reference()
                     if hasattr(policy, "reset"):
                         policy.reset(dones)
                 if args_cli.follow_camera:
@@ -271,8 +382,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     timestep += 1
                     if timestep >= args_cli.video_length:
                         break
+                elif args_cli.latent_output or args_cli.max_steps is not None:
+                    timestep += 1
+                if args_cli.latent_output and bool(dones[0].item()):
+                    break
+                if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
+                    break
         except KeyboardInterrupt:
             pass
+        finally:
+            if latent_hook is not None:
+                latent_hook.remove()
+            if args_cli.latent_output:
+                import numpy as np
+
+                if not latent_samples:
+                    raise RuntimeError("No latent samples were captured.")
+                latent_path = pathlib.Path(args_cli.latent_output)
+                latent_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    latent_path,
+                    latent=np.stack(latent_samples),
+                    motion_file=os.path.abspath(args_cli.motion_file or ""),
+                    checkpoint=os.path.abspath(resume_path),
+                    node=args_cli.latent_node,
+                )
+                print(f"[INFO]: Saved {len(latent_samples)} latent samples to: {latent_path}")
 
         env.close()
 

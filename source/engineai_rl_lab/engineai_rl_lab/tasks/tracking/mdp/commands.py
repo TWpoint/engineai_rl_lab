@@ -68,10 +68,11 @@ class MotionCommand(CommandTerm):
             selected_global_ids = torch.multinomial(
                 self._motion_sampling_probabilities,
                 num_samples=self.max_num_load_motions,
-                replacement=True,
+                replacement=self.cfg.working_set_replacement,
             )
         self.motion = self._load_motion_collection(selected_global_ids)
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._fixed_motion_ids: torch.Tensor | None = None
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_lengths = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._has_sampled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -93,6 +94,8 @@ class MotionCommand(CommandTerm):
         self.metrics["error_anchor_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_body_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
@@ -114,6 +117,10 @@ class MotionCommand(CommandTerm):
             raise ValueError("pre_failure_sample_window must be non-negative")
         if self.cfg.init_num_failures < 0:
             raise ValueError("init_num_failures must be non-negative")
+        if self.cfg.adaptive_sampling_alpha is not None and not 0.0 < self.cfg.adaptive_sampling_alpha <= 1.0:
+            raise ValueError("adaptive_sampling_alpha must be in (0, 1] or None")
+        if self.cfg.adaptive_kernel_size < 1:
+            raise ValueError("adaptive_kernel_size must be at least one")
 
     def _initialize_adaptive_sampling(self) -> None:
         motion_lengths = self._global_time_totals
@@ -140,9 +147,11 @@ class MotionCommand(CommandTerm):
         self.bin_weights /= self.bin_weights.mean()
         if self.cfg.sequence_length_agnostic:
             self.bin_weights /= self.motion_bin_counts[self.bin_motion_ids]
-        initial_count = float(self.cfg.init_num_failures)
+        initial_count = 0.0 if self.cfg.adaptive_sampling_alpha is not None else float(self.cfg.init_num_failures)
         self.adp_samp_num_episodes = torch.full((self.bin_count,), initial_count, device=self.device)
         self.adp_samp_num_failures = torch.full((self.bin_count,), initial_count, device=self.device)
+        self._current_adp_samp_num_episodes = torch.zeros(self.bin_count, device=self.device)
+        self._current_adp_samp_num_failures = torch.zeros(self.bin_count, device=self.device)
 
     def _load_motion_collection(self, selected_global_ids: torch.Tensor) -> MotionCollection:
         motion = MotionCollection(
@@ -313,27 +322,30 @@ class MotionCommand(CommandTerm):
         return self.robot.data.body_ang_vel_w.torch[:, self.robot_anchor_body_index]
 
     def _update_metrics(self):
-        self.metrics["error_anchor_pos"] = torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
-        self.metrics["error_anchor_rot"] = quat_error_magnitude(self.anchor_quat_w, self.robot_anchor_quat_w)
-        self.metrics["error_anchor_lin_vel"] = torch.norm(self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1)
-        self.metrics["error_anchor_ang_vel"] = torch.norm(self.anchor_ang_vel_w - self.robot_anchor_ang_vel_w, dim=-1)
-
-        self.metrics["error_body_pos"] = torch.norm(self.body_pos_relative_w - self.robot_body_pos_w, dim=-1).mean(
-            dim=-1
+        self.metrics["error_anchor_pos"].copy_(torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1))
+        self.metrics["error_anchor_rot"].copy_(quat_error_magnitude(self.anchor_quat_w, self.robot_anchor_quat_w))
+        self.metrics["error_anchor_lin_vel"].copy_(
+            torch.norm(self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1)
         )
-        self.metrics["error_body_rot"] = quat_error_magnitude(self.body_quat_relative_w, self.robot_body_quat_w).mean(
-            dim=-1
+        self.metrics["error_anchor_ang_vel"].copy_(
+            torch.norm(self.anchor_ang_vel_w - self.robot_anchor_ang_vel_w, dim=-1)
         )
 
-        self.metrics["error_body_lin_vel"] = torch.norm(self.body_lin_vel_w - self.robot_body_lin_vel_w, dim=-1).mean(
-            dim=-1
+        self.metrics["error_body_pos"].copy_(
+            torch.norm(self.body_pos_relative_w - self.robot_body_pos_w, dim=-1).mean(dim=-1)
         )
-        self.metrics["error_body_ang_vel"] = torch.norm(self.body_ang_vel_w - self.robot_body_ang_vel_w, dim=-1).mean(
-            dim=-1
+        self.metrics["error_body_rot"].copy_(
+            quat_error_magnitude(self.body_quat_relative_w, self.robot_body_quat_w).mean(dim=-1)
+        )
+        self.metrics["error_body_lin_vel"].copy_(
+            torch.norm(self.body_lin_vel_w - self.robot_body_lin_vel_w, dim=-1).mean(dim=-1)
+        )
+        self.metrics["error_body_ang_vel"].copy_(
+            torch.norm(self.body_ang_vel_w - self.robot_body_ang_vel_w, dim=-1).mean(dim=-1)
         )
 
-        self.metrics["error_joint_pos"] = torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1)
-        self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
+        self.metrics["error_joint_pos"].copy_(torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1))
+        self.metrics["error_joint_vel"].copy_(torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1))
 
     def _bucket_ids(self, motion_ids: torch.Tensor, time_steps: torch.Tensor) -> torch.Tensor:
         global_motion_ids = self.motion.global_ids[motion_ids]
@@ -342,7 +354,13 @@ class MotionCommand(CommandTerm):
         )
 
     def _compute_failure_rate(self) -> torch.Tensor:
-        failure_rate = self.adp_samp_num_failures / self.adp_samp_num_episodes
+        failure_rate = torch.where(
+            self.adp_samp_num_episodes > 0.0,
+            self.adp_samp_num_failures / self.adp_samp_num_episodes.clamp_min(torch.finfo(torch.float32).tiny),
+            torch.zeros_like(self.adp_samp_num_failures),
+        )
+        if self.cfg.adaptive_sampling_alpha is not None:
+            failure_rate = self._smooth_failure_rate(failure_rate)
         if not self.cfg.use_failure_rate_decay:
             return failure_rate
         failure_rate_with_decay = torch.zeros_like(failure_rate)
@@ -355,6 +373,51 @@ class MotionCommand(CommandTerm):
                 next_failure_rate = 0.0
             failure_rate_with_decay[step] = failure_rate[step] + next_failure_rate
         return failure_rate_with_decay
+
+    def _smooth_failure_rate(self, failure_rate: torch.Tensor) -> torch.Tensor:
+        """Apply MarmotLab's forward-looking kernel within each motion."""
+        if self.cfg.adaptive_kernel_size == 1:
+            return failure_rate
+        kernel = failure_rate.new_tensor(
+            [float(self.cfg.adaptive_kernel_lambda) ** index for index in range(self.cfg.adaptive_kernel_size)]
+        )
+        kernel /= kernel.sum()
+        motion_end_bins = self.motion_bin_offsets[self.bin_motion_ids] + self.motion_bin_counts[self.bin_motion_ids] - 1
+        bin_ids = torch.arange(self.bin_count, device=self.device)
+        smoothed = torch.zeros_like(failure_rate)
+        for offset, coefficient in enumerate(kernel):
+            smoothed.add_(coefficient * failure_rate[torch.minimum(bin_ids + offset, motion_end_bins)])
+        return smoothed
+
+    @staticmethod
+    def _cap_probabilities_at_uniform_ratio(probabilities: torch.Tensor, ratio: float) -> torch.Tensor:
+        """Cap final probabilities and redistribute mass exactly as MarmotLab does."""
+        probability_cap = ratio / float(probabilities.numel())
+        if probability_cap >= 1.0:
+            return probabilities
+        capped = probabilities.clamp(max=probability_cap)
+        deficit = 1.0 - capped.sum()
+        if deficit <= 0.0:
+            return capped
+        available_capacity = (probability_cap - capped).clamp_min(0.0)
+        capacity_sum = available_capacity.sum()
+        if capacity_sum <= 0.0:
+            return capped / capped.sum()
+        return capped + deficit * available_capacity / capacity_sum
+
+    def _marmot_probabilities(self, scores: torch.Tensor) -> torch.Tensor:
+        scores = scores.double()
+        if scores.sum() <= 0.0:
+            probabilities = torch.full_like(scores, 1.0 / len(scores))
+        else:
+            probabilities = scores / scores.sum()
+        probabilities.mul_(1.0 - self.cfg.uniform_sampling_rate)
+        probabilities.add_(self.cfg.uniform_sampling_rate / len(probabilities))
+        if self.cfg.adp_samp_failure_rate_max_over_mean is not None:
+            probabilities = self._cap_probabilities_at_uniform_ratio(
+                probabilities, float(self.cfg.adp_samp_failure_rate_max_over_mean)
+            )
+        return probabilities
 
     def _clip_failure_rate(self, failure_rate: torch.Tensor) -> torch.Tensor:
         multiplier = self.cfg.adp_samp_failure_rate_max_over_mean
@@ -394,17 +457,21 @@ class MotionCommand(CommandTerm):
     def _rebuild_global_sampling_distribution(self) -> None:
         """Match SONIC's full-dataset distribution used to draw a working set."""
 
-        failure_rate = self._clip_failure_rate(self._compute_failure_rate()).double()
-        failure_probabilities = failure_rate / failure_rate.sum()
-        uniform_probabilities = torch.ones_like(failure_probabilities) / self.bin_count
-        probabilities = (
-            failure_probabilities * (1.0 - self.cfg.uniform_sampling_rate)
-            + uniform_probabilities * self.cfg.uniform_sampling_rate
-        )
-        probabilities *= self.bin_weights
-        probabilities /= probabilities.sum()
-        all_bin_ids = torch.arange(self.bin_count, device=self.device)
-        probabilities = self._apply_probability_caps(probabilities, all_bin_ids)
+        failure_rate = self._compute_failure_rate()
+        if self.cfg.adaptive_sampling_alpha is not None:
+            probabilities = self._marmot_probabilities(failure_rate)
+        else:
+            failure_rate = self._clip_failure_rate(failure_rate).double()
+            failure_probabilities = failure_rate / failure_rate.sum()
+            uniform_probabilities = torch.ones_like(failure_probabilities) / self.bin_count
+            probabilities = (
+                failure_probabilities * (1.0 - self.cfg.uniform_sampling_rate)
+                + uniform_probabilities * self.cfg.uniform_sampling_rate
+            )
+            probabilities *= self.bin_weights
+            probabilities /= probabilities.sum()
+            all_bin_ids = torch.arange(self.bin_count, device=self.device)
+            probabilities = self._apply_probability_caps(probabilities, all_bin_ids)
         self.adp_sampling_prob = probabilities.float()
         motion_sampling_probabilities = torch.zeros(self.global_num_motions, dtype=torch.float32, device=self.device)
         motion_sampling_probabilities.index_add_(0, self.bin_motion_ids, self.adp_sampling_prob)
@@ -413,17 +480,20 @@ class MotionCommand(CommandTerm):
     def _rebuild_sampling_distribution(self) -> None:
         """Match SONIC's adaptive distribution over the active working set."""
 
-        active_failure_rate = self._compute_failure_rate()[self._active_bin_ids].double()
-        active_failure_rate = self._clip_failure_rate(active_failure_rate)
-        failure_probabilities = active_failure_rate / active_failure_rate.sum()
-        uniform_probabilities = torch.ones_like(failure_probabilities) / len(failure_probabilities)
-        probabilities = (
-            failure_probabilities * (1.0 - self.cfg.uniform_sampling_rate)
-            + uniform_probabilities * self.cfg.uniform_sampling_rate
-        )
-        probabilities *= self.bin_weights[self._active_bin_ids]
-        probabilities /= probabilities.sum()
-        probabilities = self._apply_probability_caps(probabilities, self._active_bin_ids)
+        active_failure_rate = self._compute_failure_rate()[self._active_bin_ids]
+        if self.cfg.adaptive_sampling_alpha is not None:
+            probabilities = self._marmot_probabilities(active_failure_rate)
+        else:
+            active_failure_rate = self._clip_failure_rate(active_failure_rate.double())
+            failure_probabilities = active_failure_rate / active_failure_rate.sum()
+            uniform_probabilities = torch.ones_like(failure_probabilities) / len(failure_probabilities)
+            probabilities = (
+                failure_probabilities * (1.0 - self.cfg.uniform_sampling_rate)
+                + uniform_probabilities * self.cfg.uniform_sampling_rate
+            )
+            probabilities *= self.bin_weights[self._active_bin_ids]
+            probabilities /= probabilities.sum()
+            probabilities = self._apply_probability_caps(probabilities, self._active_bin_ids)
         if not torch.all(torch.isfinite(probabilities)) or torch.any(probabilities < 0.0):
             raise RuntimeError("Adaptive motion sampling produced invalid probabilities")
         self.adp_sampling_active_prob = probabilities.float()
@@ -449,8 +519,32 @@ class MotionCommand(CommandTerm):
             return
         time_steps = torch.minimum(self.time_steps[active_env_ids], self.motion_lengths[active_env_ids] - 1)
         bin_ids = self._bucket_ids(self.motion_ids[active_env_ids], time_steps)
-        bin_lengths = (self.bin_ends[bin_ids] - self.bin_starts[bin_ids]).float()
-        self.adp_samp_num_episodes.index_add_(0, bin_ids, bin_lengths.reciprocal())
+        if self.cfg.adaptive_sampling_alpha is not None:
+            self._current_adp_samp_num_episodes.index_add_(0, bin_ids, torch.ones_like(bin_ids, dtype=torch.float))
+        else:
+            bin_lengths = (self.bin_ends[bin_ids] - self.bin_starts[bin_ids]).float()
+            self.adp_samp_num_episodes.index_add_(0, bin_ids, bin_lengths.reciprocal())
+
+    def set_fixed_motion_ids(self, motion_ids: Sequence[int] | torch.Tensor) -> None:
+        """Pin every environment to one process-local motion for deterministic evaluation.
+
+        The assignment is retained across environment resets.  Training and
+        normal playback remain adaptive until this method is called.
+        """
+
+        fixed_motion_ids = torch.as_tensor(motion_ids, dtype=torch.long, device=self.device)
+        if fixed_motion_ids.shape != (self.num_envs,):
+            raise ValueError(
+                f"fixed motion assignment must have shape ({self.num_envs},), got {tuple(fixed_motion_ids.shape)}"
+            )
+        if torch.any(fixed_motion_ids < 0) or torch.any(fixed_motion_ids >= self.motion.num_motions):
+            raise ValueError(f"fixed motion ids must be in [0, {self.motion.num_motions})")
+        self._fixed_motion_ids = fixed_motion_ids.clone()
+
+    def clear_fixed_motion_ids(self) -> None:
+        """Restore adaptive motion selection after deterministic evaluation."""
+
+        self._fixed_motion_ids = None
 
     def _adaptive_sampling(self, env_ids: Sequence[int]):
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
@@ -464,7 +558,12 @@ class MotionCommand(CommandTerm):
             episode_failed = self._env.termination_manager.terminated[previous_env_ids]
             if torch.any(episode_failed):
                 failed_bins = previous_bins[episode_failed]
-                self.adp_samp_num_failures.index_add_(
+                failure_buffer = (
+                    self._current_adp_samp_num_failures
+                    if self.cfg.adaptive_sampling_alpha is not None
+                    else self.adp_samp_num_failures
+                )
+                failure_buffer.index_add_(
                     0,
                     failed_bins,
                     torch.full_like(
@@ -474,26 +573,36 @@ class MotionCommand(CommandTerm):
                     ),
                 )
 
-        sampled_active_bin_ids = torch.multinomial(
-            self.adp_sampling_active_prob,
-            num_samples=len(env_ids),
-            replacement=True,
-        )
-        sampled_bins = self._active_bin_ids[sampled_active_bin_ids]
-        sampled_motion_ids = self._active_local_motion_ids[sampled_active_bin_ids]
+        if self._fixed_motion_ids is None:
+            sampled_active_bin_ids = torch.multinomial(
+                self.adp_sampling_active_prob,
+                num_samples=len(env_ids),
+                replacement=True,
+            )
+            sampled_bins = self._active_bin_ids[sampled_active_bin_ids]
+            sampled_motion_ids = self._active_local_motion_ids[sampled_active_bin_ids]
+        else:
+            sampled_motion_ids = self._fixed_motion_ids[env_ids]
+            sampled_global_motion_ids = self.motion.global_ids[sampled_motion_ids]
+            sampled_motion_bin_counts = self.motion_bin_counts[sampled_global_motion_ids]
+            sampled_local_bin_ids = (torch.rand(len(env_ids), device=self.device) * sampled_motion_bin_counts).long()
+            sampled_bins = self.motion_bin_offsets[sampled_global_motion_ids] + sampled_local_bin_ids
         self.motion_ids[env_ids] = sampled_motion_ids
         self.motion_lengths[env_ids] = self.motion.lengths(sampled_motion_ids)
         bin_lengths = self.bin_ends[sampled_bins] - self.bin_starts[sampled_bins]
-        sampled_time_steps = (
-            self.bin_starts[sampled_bins] + (torch.rand(len(env_ids), device=self.device) * bin_lengths).long()
-        )
-        if self.cfg.pre_failure_sample_window > 0:
-            pre_failure_offsets = torch.randint(
-                self.cfg.pre_failure_sample_window,
-                (len(env_ids),),
-                device=self.device,
+        if self.cfg.start_at_motion_beginning:
+            sampled_time_steps = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+        else:
+            sampled_time_steps = (
+                self.bin_starts[sampled_bins] + (torch.rand(len(env_ids), device=self.device) * bin_lengths).long()
             )
-            sampled_time_steps = (sampled_time_steps - pre_failure_offsets).clamp_min(0)
+            if self.cfg.pre_failure_sample_window > 0:
+                pre_failure_offsets = torch.randint(
+                    self.cfg.pre_failure_sample_window,
+                    (len(env_ids),),
+                    device=self.device,
+                )
+                sampled_time_steps = (sampled_time_steps - pre_failure_offsets).clamp_min(0)
         self.time_steps[env_ids] = sampled_time_steps
         self._has_sampled[env_ids] = True
         # CommandTerm.reset clears metrics for reset environments before
@@ -533,17 +642,24 @@ class MotionCommand(CommandTerm):
         self._adaptive_layout_checked = True
 
     def sync_and_compute_adaptive_sampling(self, *, sync_across_ranks: bool) -> None:
-        """Recompute every PPO iteration and average cumulative stats every 200 iterations."""
+        """Advance EMA every PPO iteration and periodically average it across ranks."""
 
         if sync_across_ranks:
             self._check_adaptive_distributed_layout()
+        if self.cfg.adaptive_sampling_alpha is not None:
+            alpha = float(self.cfg.adaptive_sampling_alpha)
+            self.adp_samp_num_episodes.mul_(1.0 - alpha).add_(self._current_adp_samp_num_episodes, alpha=alpha)
+            self.adp_samp_num_failures.mul_(1.0 - alpha).add_(self._current_adp_samp_num_failures, alpha=alpha)
+            self._current_adp_samp_num_episodes.zero_()
+            self._current_adp_samp_num_failures.zero_()
         if sync_across_ranks and torch.distributed.is_available() and torch.distributed.is_initialized():
-            packed = torch.cat((self.adp_samp_num_episodes, self.adp_samp_num_failures))
+            statistics = (self.adp_samp_num_episodes, self.adp_samp_num_failures)
+            packed = torch.cat(statistics)
             torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
             packed /= torch.distributed.get_world_size()
             episodes, failures = packed.chunk(2)
-            self.adp_samp_num_episodes.copy_(episodes)
-            self.adp_samp_num_failures.copy_(failures)
+            statistics[0].copy_(episodes)
+            statistics[1].copy_(failures)
         self._rebuild_global_sampling_distribution()
         self._rebuild_sampling_distribution()
 
@@ -563,7 +679,10 @@ class MotionCommand(CommandTerm):
             return False
         self.adp_samp_num_episodes.copy_(episodes.to(self.device))
         self.adp_samp_num_failures.copy_(failures.to(self.device))
-        self.sync_and_compute_adaptive_sampling(sync_across_ranks=False)
+        self._current_adp_samp_num_episodes.zero_()
+        self._current_adp_samp_num_failures.zero_()
+        self._rebuild_global_sampling_distribution()
+        self._rebuild_sampling_distribution()
         return True
 
     def resample_motion_working_set(self) -> bool:
@@ -573,9 +692,10 @@ class MotionCommand(CommandTerm):
         selected_global_ids = torch.multinomial(
             self._motion_sampling_probabilities,
             num_samples=self.max_num_load_motions,
-            replacement=True,
+            replacement=self.cfg.working_set_replacement,
         )
         self._has_sampled.zero_()
+        self._fixed_motion_ids = None
         self.motion_ids.zero_()
         self.motion_lengths.zero_()
         del self.motion
@@ -720,6 +840,9 @@ class MotionCommandCfg(CommandTermCfg):
     # SONIC loads all motions when they fit; otherwise each rank independently
     # draws a replacement-sampled working set of min(num_envs, 1024) motions.
     max_num_load_motions: int | None = None
+    # Sampling with replacement matches SONIC. Disable it to keep every
+    # process-local working set unique while allowing overlap across ranks.
+    working_set_replacement: bool = True
     # NPZ files are decoded concurrently but consumed in manifest order.
     motion_load_workers: int = 4
     # Upper bound for one process-local construction/runtime chunk.
@@ -735,6 +858,9 @@ class MotionCommandCfg(CommandTermCfg):
     # When disabled, the environment is expected to terminate at the final
     # motion frame instead of silently switching to another motion.
     resample_at_motion_end: bool = True
+    # Playback/debug option. Training keeps random motion-time initialization
+    # unless this is explicitly enabled by a caller such as play.py.
+    start_at_motion_beginning: bool = False
 
     bin_size: int = 50
     sequence_length_agnostic: bool = True
@@ -743,6 +869,11 @@ class MotionCommandCfg(CommandTermCfg):
     pre_failure_sample_window: int = 200
     use_failure_rate_decay: bool = False
     decay_gamma: float = 0.8
+    # None retains the legacy cumulative SONIC sampler. A value enables
+    # MarmotLab-style EMA statistics and forward-kernel smoothing.
+    adaptive_sampling_alpha: float | None = None
+    adaptive_kernel_size: int = 1
+    adaptive_kernel_lambda: float = 0.8
     adp_samp_failure_rate_max_over_mean: float | None = 200.0
     failure_counts_multiplier: float = 1.0
     max_prob_per_bin: str | float | None = None

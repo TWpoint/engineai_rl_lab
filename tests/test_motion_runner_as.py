@@ -46,3 +46,31 @@ def test_runner_reloads_and_resets_every_250_iterations() -> None:
     assert unchanged is original_obs
     torch.testing.assert_close(reloaded, torch.tensor([2.0]))
     assert reset_calls == 1
+
+
+def test_runner_staggers_refresh_by_local_rank_on_each_node(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    refresh_calls = 0
+
+    def _refresh() -> bool:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return False
+
+    command = SimpleNamespace(resample_motion_working_set=_refresh)
+    runner = SimpleNamespace(
+        cfg={"motion_resample_frequency": 250, "stagger_motion_working_set_refresh": True},
+        gpu_local_rank=3,
+        device="cpu",
+        env=SimpleNamespace(),
+        _motion_command=lambda: command,
+    )
+    obs = torch.tensor([1.0])
+
+    # Refresh events 0, 1, 2 target local ranks 0, 1, 2.
+    for iteration in (249, 499, 749):
+        assert MotionOnPolicyRunner._resample_motion_working_set(runner, iteration, obs) is obs
+    # Refresh event 3 selects local rank 3 on every node.
+    assert MotionOnPolicyRunner._resample_motion_working_set(runner, 999, obs) is obs
+
+    assert refresh_calls == 1

@@ -21,6 +21,16 @@ from engineai_rl_lab.tasks.tracking.config.t800.agents.rsl_rl_ppo_cfg_v11_n1 imp
     T800FlatV11N1PPORunnerCfg,
     T800FlatV11N1ScaleLafanPPORunnerCfg,
 )
+from engineai_rl_lab.tasks.tracking.config.t800.agents.rsl_rl_ppo_cfg_v11_n2 import (
+    T800FlatV11N2PPORunnerCfg,
+    T800FlatV11N2ScaleLafanPPORunnerCfg,
+)
+from engineai_rl_lab.tasks.tracking.config.t800.agents.rsl_rl_ppo_cfg_v12 import (
+    V12_COMMAND_TOPOLOGY,
+    T800FlatV12PPORunnerCfg,
+    T800FlatV12ScaleLafanPPORunnerCfg,
+    T800FlatV12ScaleLafanSonicPPORunnerCfg,
+)
 from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v8 import T800FlatWoStateEstimationEnvCfgV8Scale
 from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v9 import (
     V9_FRAME_OFFSETS,
@@ -38,6 +48,15 @@ from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v11 import (
 from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v11_n1 import (
     T800FlatWoStateEstimationEnvCfgV11N1,
     T800FlatWoStateEstimationEnvCfgV11N1ScaleLafan,
+)
+from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v11_n2 import (
+    T800FlatWoStateEstimationEnvCfgV11N2,
+    T800FlatWoStateEstimationEnvCfgV11N2ScaleLafan,
+)
+from engineai_rl_lab.tasks.tracking.config.t800.flat_env_cfg_v12 import (
+    T800FlatWoStateEstimationEnvCfgV12,
+    T800FlatWoStateEstimationEnvCfgV12ScaleLafan,
+    T800FlatWoStateEstimationEnvCfgV12ScaleLafanSonic,
 )
 from engineai_rl_lab.tasks.tracking.mdp.observations import (
     _pose_by_entity_xz,
@@ -347,7 +366,10 @@ def test_v11_n1_uses_v9_actor_with_structured_target_only_tokens() -> None:
     v11_n1_runner.pop("run_name")
     assert v11_n1_runner == v9_runner
     assert runner_cfg.run_name == "v11-n1"
+    assert runner_cfg.actor.nodes["attention_blocks"]["cell"]["num_blocks"] == 2
     assert runner_cfg.actor.nodes["attention_blocks"]["cell"]["ffn_dim"] == 384
+    assert runner_cfg.algorithm.num_mini_batches == 32
+    assert runner_cfg.algorithm.actor_learning_rate == 5.0e-5
     assert actor.nodes["command_projection"].mlp[0].in_features == 81
     assert actor(observations).shape == (2, 25)
 
@@ -359,10 +381,168 @@ def test_v11_n1_scale_lafan_only_changes_the_motion_pool_and_run_name() -> None:
 
     baseline_motion_cfg = baseline_env_cfg.commands.motion.to_dict()
     scale_motion_cfg = env_cfg.commands.motion.to_dict()
-    for field_name in ("motion_file", "motion_chunk_frames"):
+    for field_name in ("motion_file", "motion_chunk_frames", "motion_load_workers"):
         baseline_motion_cfg.pop(field_name)
         scale_motion_cfg.pop(field_name)
     assert scale_motion_cfg == baseline_motion_cfg
     assert env_cfg.commands.motion.motion_file.endswith("lafan_and_slow2x_v0.yaml")
     assert env_cfg.commands.motion.motion_chunk_frames == 8_388_608
     assert runner_cfg.run_name == "v11-n1-scale-lafan"
+
+
+def test_v11_n2_only_changes_marmotlab_aligned_actor_optimization() -> None:
+    n1_env_cfg = T800FlatWoStateEstimationEnvCfgV11N1()
+    env_cfg = T800FlatWoStateEstimationEnvCfgV11N2()
+    n1_runner_cfg = T800FlatV11N1PPORunnerCfg()
+    runner_cfg = T800FlatV11N2PPORunnerCfg()
+
+    assert env_cfg.to_dict() == n1_env_cfg.to_dict()
+    assert runner_cfg.run_name == "v11-n2"
+    assert runner_cfg.actor.nodes["attention_blocks"]["cell"]["num_blocks"] == 2
+    assert runner_cfg.actor.nodes["attention_blocks"]["cell"]["ffn_dim"] == 384
+    assert runner_cfg.algorithm.num_mini_batches == 64
+    assert runner_cfg.algorithm.actor_learning_rate == 2.0e-5
+    assert runner_cfg.algorithm.critic_learning_rate == 5.0e-4
+
+    n1_runner = n1_runner_cfg.to_dict()
+    n2_runner = runner_cfg.to_dict()
+    n1_runner.pop("run_name")
+    n2_runner.pop("run_name")
+    n1_runner["algorithm"]["num_mini_batches"] = 64
+    n1_runner["algorithm"]["actor_learning_rate"] = 2.0e-5
+    assert n2_runner == n1_runner
+
+
+def test_v11_n2_scale_lafan_only_changes_the_motion_pool_and_run_name() -> None:
+    baseline_env_cfg = T800FlatWoStateEstimationEnvCfgV11N2()
+    env_cfg = T800FlatWoStateEstimationEnvCfgV11N2ScaleLafan()
+    runner_cfg = T800FlatV11N2ScaleLafanPPORunnerCfg()
+
+    baseline_motion_cfg = baseline_env_cfg.commands.motion.to_dict()
+    scale_motion_cfg = env_cfg.commands.motion.to_dict()
+    for field_name in ("motion_file", "motion_chunk_frames", "motion_load_workers"):
+        baseline_motion_cfg.pop(field_name)
+        scale_motion_cfg.pop(field_name)
+    assert scale_motion_cfg == baseline_motion_cfg
+    assert env_cfg.commands.motion.motion_file.endswith("lafan_and_slow2x_v0.yaml")
+    assert env_cfg.commands.motion.motion_chunk_frames == 8_388_608
+    assert runner_cfg.run_name == "v11-n2-scale-lafan"
+
+
+def test_v12_adds_named_proprioception_with_gravity_and_gelu_projections() -> None:
+    v11_env_cfg = T800FlatWoStateEstimationEnvCfgV11N2()
+    env_cfg = T800FlatWoStateEstimationEnvCfgV12()
+    v11_runner_cfg = T800FlatV11N2PPORunnerCfg()
+    runner_cfg = T800FlatV12PPORunnerCfg()
+    observations = TensorDict(
+        {
+            "proprioception": torch.randn(2, 5, 56),
+            "action": torch.randn(2, 4, 25),
+            "command": torch.randn(2, 14, 81),
+            "critic": torch.randn(2, 392),
+        },
+        batch_size=[2],
+    )
+    actor_cfg = runner_cfg.actor.to_dict()
+    actor_cfg.pop("class_name")
+    actor = ModelGraph(observations, runner_cfg.obs_groups, "actor", 25, **actor_cfg)
+
+    assert env_cfg.observations.policy is None
+    assert env_cfg.observations.proprioception.history_length == 5
+    assert not env_cfg.observations.proprioception.flatten_history_dim
+    assert env_cfg.observations.proprioception.actions is None
+    assert env_cfg.observations.proprioception.projected_gravity.func is mdp.projected_gravity
+    assert env_cfg.observations.proprioception.projected_gravity.noise.n_min == -0.05
+    assert env_cfg.observations.proprioception.projected_gravity.noise.n_max == 0.05
+    assert env_cfg.observations.action.to_dict() == v11_env_cfg.observations.action.to_dict()
+    v11_policy_cfg = v11_env_cfg.observations.policy.to_dict()
+    v12_proprioception_cfg = env_cfg.observations.proprioception.to_dict()
+    v12_proprioception_cfg.pop("projected_gravity")
+    assert v12_proprioception_cfg == v11_policy_cfg
+    assert env_cfg.commands.to_dict() == v11_env_cfg.commands.to_dict()
+    assert env_cfg.rewards.to_dict() == v11_env_cfg.rewards.to_dict()
+    assert env_cfg.terminations.to_dict() == v11_env_cfg.terminations.to_dict()
+
+    assert runner_cfg.run_name == "v12"
+    assert runner_cfg.obs_groups["actor"] == ["proprioception", "action", "command"]
+    assert runner_cfg.obs_groups["critic"] == v11_runner_cfg.obs_groups["critic"]
+    assert "policy_projection" not in runner_cfg.actor.nodes
+    assert "proprioception_projection" in runner_cfg.actor.nodes
+    assert "action_projection" in runner_cfg.actor.nodes
+    assert "token_interleaver" in runner_cfg.actor.nodes
+    for projection_name in ("proprioception_projection", "action_projection", "command_projection"):
+        assert runner_cfg.actor.nodes[projection_name]["cell"]["activation"] == "gelu"
+    topology_cfg = runner_cfg.actor.nodes["topology_projection"]["cell"]
+    assert topology_cfg["topology"] == V12_COMMAND_TOPOLOGY
+    assert topology_cfg["hidden_dims"] == [64]
+    assert topology_cfg["activation"] == "gelu"
+    topology = torch.tensor(V12_COMMAND_TOPOLOGY)
+    assert topology.shape == (14, 9)
+    assert torch.all(topology[:, :4].sum(dim=1) == 1)
+    assert torch.all(topology[:, 4:7].sum(dim=1) == 1)
+    assert torch.all((topology[:, 7] >= 0) & (topology[:, 7] <= 1))
+    assert set(topology[:, 8].tolist()) == {0.0, 1.0}
+    topology_projection = actor.nodes["topology_projection"].projection
+    assert topology_projection[0].weight.shape == (64, 9)
+    assert isinstance(topology_projection[1], torch.nn.GELU)
+    assert topology_projection[2].weight.shape == (256, 64)
+    v11_actor_cfg = v11_runner_cfg.actor.to_dict()
+    v12_actor_cfg = runner_cfg.actor.to_dict()
+    v11_actor_cfg["nodes"]["proprioception_projection"] = v11_actor_cfg["nodes"].pop("policy_projection")
+    for route in v11_actor_cfg["routes"]:
+        if route["source"] == "inputs.policy":
+            route["source"] = "inputs.proprioception"
+        for endpoint in ("source", "target"):
+            route[endpoint] = route[endpoint].replace(
+                "nodes.policy_projection.",
+                "nodes.proprioception_projection.",
+            )
+    for projection_name in ("proprioception_projection", "action_projection", "command_projection"):
+        v11_actor_cfg["nodes"][projection_name]["cell"]["activation"] = "gelu"
+    v11_actor_cfg["nodes"]["topology_projection"]["cell"].update(
+        topology=V12_COMMAND_TOPOLOGY,
+        hidden_dims=[64],
+        activation="gelu",
+    )
+    assert v12_actor_cfg == v11_actor_cfg
+    assert runner_cfg.actor.nodes["attention_blocks"]["cell"]["num_blocks"] == 2
+    assert runner_cfg.actor.nodes["attention_blocks"]["cell"]["ffn_type"] == "swiglu"
+    assert runner_cfg.algorithm.to_dict() == v11_runner_cfg.algorithm.to_dict()
+    assert actor(observations).shape == (2, 25)
+
+
+def test_v12_scale_lafan_only_changes_the_motion_pool_and_run_name() -> None:
+    baseline_env_cfg = T800FlatWoStateEstimationEnvCfgV12()
+    env_cfg = T800FlatWoStateEstimationEnvCfgV12ScaleLafan()
+    runner_cfg = T800FlatV12ScaleLafanPPORunnerCfg()
+
+    baseline_motion_cfg = baseline_env_cfg.commands.motion.to_dict()
+    scale_motion_cfg = env_cfg.commands.motion.to_dict()
+    for field_name in ("motion_file", "motion_chunk_frames", "motion_load_workers"):
+        baseline_motion_cfg.pop(field_name)
+        scale_motion_cfg.pop(field_name)
+    assert scale_motion_cfg == baseline_motion_cfg
+    assert env_cfg.commands.motion.motion_file.endswith("lafan_and_slow2x_v0.yaml")
+    assert env_cfg.commands.motion.motion_chunk_frames == 8_388_608
+    assert runner_cfg.run_name == "v12-scale-lafan"
+
+
+def test_v12_scale_lafan_sonic_only_extends_the_motion_pool_and_run_name() -> None:
+    lafan_env_cfg = T800FlatWoStateEstimationEnvCfgV12ScaleLafan()
+    env_cfg = T800FlatWoStateEstimationEnvCfgV12ScaleLafanSonic()
+    lafan_runner_cfg = T800FlatV12ScaleLafanPPORunnerCfg()
+    runner_cfg = T800FlatV12ScaleLafanSonicPPORunnerCfg()
+
+    lafan_motion_cfg = lafan_env_cfg.commands.motion.to_dict()
+    sonic_motion_cfg = env_cfg.commands.motion.to_dict()
+    lafan_motion_cfg.pop("motion_file")
+    sonic_motion_cfg.pop("motion_file")
+    assert sonic_motion_cfg == lafan_motion_cfg
+    assert env_cfg.commands.motion.motion_file.endswith("lafan_slow2x_and_sonic_v0.yaml")
+    assert runner_cfg.run_name == "v12-scale-lafan-sonic"
+
+    runner_cfg_dict = runner_cfg.to_dict()
+    lafan_runner_cfg_dict = lafan_runner_cfg.to_dict()
+    runner_cfg_dict.pop("run_name")
+    lafan_runner_cfg_dict.pop("run_name")
+    assert runner_cfg_dict == lafan_runner_cfg_dict

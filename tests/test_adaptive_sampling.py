@@ -17,8 +17,12 @@ def _command(*, active_global_ids: tuple[int, ...] = (0, 1)) -> SimpleNamespace:
         init_num_failures=1.0,
         uniform_sampling_rate=0.1,
         pre_failure_sample_window=0,
+        start_at_motion_beginning=False,
         use_failure_rate_decay=False,
         decay_gamma=0.8,
+        adaptive_sampling_alpha=None,
+        adaptive_kernel_size=1,
+        adaptive_kernel_lambda=0.8,
         adp_samp_failure_rate_max_over_mean=200.0,
         failure_counts_multiplier=1.0,
         max_prob_per_bin=None,
@@ -34,6 +38,8 @@ def _command(*, active_global_ids: tuple[int, ...] = (0, 1)) -> SimpleNamespace:
     command.bin_weights = torch.ones(2)
     command.adp_samp_num_episodes = torch.ones(2)
     command.adp_samp_num_failures = torch.ones(2)
+    command._current_adp_samp_num_episodes = torch.zeros(2)
+    command._current_adp_samp_num_failures = torch.zeros(2)
     command.metrics = {
         "sampling_entropy": torch.zeros(2),
         "sampling_top1_prob": torch.zeros(2),
@@ -52,6 +58,7 @@ def _command(*, active_global_ids: tuple[int, ...] = (0, 1)) -> SimpleNamespace:
     command._active_bin_ids = global_ids.clone()
     command._active_local_motion_ids = torch.arange(len(global_ids))
     command.motion_ids = torch.zeros(2, dtype=torch.long)
+    command._fixed_motion_ids = None
     command.time_steps = torch.zeros(2, dtype=torch.long)
     command.motion_lengths = torch.zeros(2, dtype=torch.long)
     command._has_sampled = torch.zeros(2, dtype=torch.bool)
@@ -60,18 +67,23 @@ def _command(*, active_global_ids: tuple[int, ...] = (0, 1)) -> SimpleNamespace:
     for method_name in (
         "_bucket_ids",
         "_compute_failure_rate",
+        "_smooth_failure_rate",
+        "_marmot_probabilities",
         "_clip_failure_rate",
         "_configured_probability_cap",
         "_apply_probability_caps",
         "_rebuild_global_sampling_distribution",
         "_rebuild_sampling_distribution",
         "_update_adaptive_exposure",
+        "set_fixed_motion_ids",
+        "clear_fixed_motion_ids",
         "_check_adaptive_distributed_layout",
         "sync_and_compute_adaptive_sampling",
         "get_adaptive_sampling_state",
         "load_adaptive_sampling_state",
     ):
         setattr(command, method_name, MethodType(getattr(MotionCommand, method_name), command))
+    command._cap_probabilities_at_uniform_ratio = MotionCommand._cap_probabilities_at_uniform_ratio
     command._rebuild_global_sampling_distribution()
     command._rebuild_sampling_distribution()
     return command
@@ -105,6 +117,41 @@ def test_replacement_sample_maps_duplicate_active_motion(monkeypatch: pytest.Mon
     assert command.motion_ids[0].item() == 1
     assert command.motion_lengths[0].item() == 8
     assert MotionCommand._bucket_ids(command, torch.tensor([1]), torch.tensor([2])).item() == 1
+
+
+def test_start_at_motion_beginning_forces_frame_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    command = _command()
+    command.cfg.start_at_motion_beginning = True
+    command.bin_starts[:] = torch.tensor([3, 4])
+    command.bin_ends[:] = torch.tensor([8, 8])
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda probabilities, num_samples, replacement: torch.tensor([0, 1]),
+    )
+
+    MotionCommand._adaptive_sampling(command, torch.tensor([0, 1]))
+
+    torch.testing.assert_close(command.time_steps, torch.zeros(2, dtype=torch.long))
+
+
+def test_fixed_motion_assignment_is_retained_across_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
+    command = _command()
+    command.cfg.start_at_motion_beginning = True
+    command.set_fixed_motion_ids(torch.tensor([1, 0]))
+    monkeypatch.setattr(
+        torch,
+        "multinomial",
+        lambda *args, **kwargs: pytest.fail("fixed assignment must not sample a motion"),
+    )
+
+    MotionCommand._adaptive_sampling(command, torch.tensor([0, 1]))
+
+    torch.testing.assert_close(command.motion_ids, torch.tensor([1, 0]))
+    torch.testing.assert_close(command.time_steps, torch.zeros(2, dtype=torch.long))
+
+    command.clear_fixed_motion_ids()
+    assert command._fixed_motion_ids is None
 
 
 def test_active_bins_accumulate_sonic_length_normalized_episode_count() -> None:
@@ -170,6 +217,33 @@ def test_adaptive_sampling_state_round_trip() -> None:
 
     torch.testing.assert_close(restored.adp_samp_num_episodes, source.adp_samp_num_episodes)
     torch.testing.assert_close(restored.adp_samp_num_failures, source.adp_samp_num_failures)
+
+
+def test_marmot_ema_advances_and_clears_current_statistics() -> None:
+    command = _command()
+    command.cfg.adaptive_sampling_alpha = 0.5
+    command.cfg.adaptive_kernel_size = 1
+    command.cfg.adp_samp_failure_rate_max_over_mean = 10.0
+    command.adp_samp_num_episodes.zero_()
+    command.adp_samp_num_failures.zero_()
+    command._current_adp_samp_num_episodes[:] = torch.tensor([2.0, 4.0])
+    command._current_adp_samp_num_failures[:] = torch.tensor([1.0, 0.0])
+
+    command.sync_and_compute_adaptive_sampling(sync_across_ranks=False)
+
+    torch.testing.assert_close(command.adp_samp_num_episodes, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(command.adp_samp_num_failures, torch.tensor([0.5, 0.0]))
+    torch.testing.assert_close(command._current_adp_samp_num_episodes, torch.zeros(2))
+    torch.testing.assert_close(command._current_adp_samp_num_failures, torch.zeros(2))
+
+
+def test_marmot_probability_cap_limits_final_probability() -> None:
+    probabilities = torch.tensor([0.97, 0.01, 0.01, 0.01], dtype=torch.float64)
+
+    capped = MotionCommand._cap_probabilities_at_uniform_ratio(probabilities, ratio=2.0)
+
+    torch.testing.assert_close(capped.sum(), torch.tensor(1.0, dtype=torch.float64))
+    assert capped.max() <= 0.5
 
 
 def test_layout_check_waits_for_distributed_initialization(monkeypatch: pytest.MonkeyPatch) -> None:

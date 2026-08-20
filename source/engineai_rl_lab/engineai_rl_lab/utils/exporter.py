@@ -8,7 +8,6 @@ import math
 import os
 
 # import numpy as np
-
 import onnx
 
 # import re
@@ -302,7 +301,9 @@ def _build_policy_inputs(env: ManagerBasedRLEnv, actor_obs_groups: list[str], mo
             term_entries.append({"name": term_name, "size": term_size_with_history // term_history_length})
 
         shape = input_shapes[tensor_name]
-        if math.prod(shape) != sum(term["size"] * _term_history_length(group_cfg, term["name"]) for term in term_entries):
+        if math.prod(shape) != sum(
+            term["size"] * _term_history_length(group_cfg, term["name"]) for term in term_entries
+        ):
             raise ValueError(
                 f"ONNX input '{tensor_name}' shape {shape} does not match observation group '{group_name}'."
             )
@@ -320,6 +321,35 @@ def _build_policy_inputs(env: ManagerBasedRLEnv, actor_obs_groups: list[str], mo
     return policy_inputs
 
 
+def _build_legacy_observation_metadata(
+    env: ManagerBasedRLEnv, actor_obs_groups: list[str]
+) -> tuple[list[str], list[int]]:
+    """Build compatibility metadata without assuming an observation group named ``policy``.
+
+    Schema-v2 deployments consume ``policy_inputs`` below.  The flat fields are
+    retained for older tooling, so for a multi-input actor they describe the
+    first configured actor group instead of incorrectly flattening all named
+    inputs into one tensor.
+    """
+    if not actor_obs_groups:
+        raise ValueError("At least one actor observation group is required to export metadata.")
+
+    legacy_group_name = "policy" if "policy" in actor_obs_groups else actor_obs_groups[0]
+    try:
+        observation_names = list(env.observation_manager.active_terms[legacy_group_name])
+    except KeyError as err:
+        available_groups = list(env.observation_manager.active_terms)
+        raise ValueError(
+            f"Actor observation group '{legacy_group_name}' is unavailable; available groups are {available_groups}."
+        ) from err
+
+    group_cfg = _group_cfg(env, legacy_group_name)
+    observation_history_lengths = [
+        _term_history_length(group_cfg, observation_name) for observation_name in observation_names
+    ]
+    return observation_names, observation_history_lengths
+
+
 def attach_onnx_metadata(
     env: ManagerBasedRLEnv,
     run_path: str,
@@ -330,17 +360,8 @@ def attach_onnx_metadata(
     onnx_path = os.path.join(path, filename)
     robot = env.scene["robot"]
 
-    actor_obs_groups = actor_obs_groups or ["policy"]
-    observation_names = env.observation_manager.active_terms["policy"]
-    observation_history_lengths: list[int] = []
-
-    if env.observation_manager.cfg.policy.history_length is not None:
-        observation_history_lengths = [env.observation_manager.cfg.policy.history_length] * len(observation_names)
-    else:
-        for name in observation_names:
-            term_cfg = env.observation_manager.cfg.policy.to_dict()[name]
-            history_length = term_cfg["history_length"]
-            observation_history_lengths.append(1 if history_length == 0 else history_length)
+    actor_obs_groups = list(actor_obs_groups or ["policy"])
+    observation_names, observation_history_lengths = _build_legacy_observation_metadata(env, actor_obs_groups)
 
     default_joint_pos_nominal = getattr(robot.data, "default_joint_pos_nominal", None)
     if default_joint_pos_nominal is None:
@@ -369,7 +390,7 @@ def attach_onnx_metadata(
         # "anchor_body_name": env.command_manager.get_term("motion").cfg.anchor_body_name,
         # "body_names": env.command_manager.get_term("motion").cfg.body_names,
     }
-    metadata["policy_inputs"] = _build_policy_inputs(env, list(actor_obs_groups), model)
+    metadata["policy_inputs"] = _build_policy_inputs(env, actor_obs_groups, model)
 
     # 保存文件
     class CustomListDumper(yaml.SafeDumper):
