@@ -63,12 +63,15 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         except (KeyError, ValueError):
             return None
 
-    def _sync_adaptive_sampling(self, iteration: int) -> None:
+    def _sync_adaptive_sampling(self, iteration: int, force_sync: bool = False) -> None:
         command = self._motion_command()
         if command is None or not hasattr(command, "sync_and_compute_adaptive_sampling"):
             return
         frequency = int(self.cfg.get("sync_adaptive_sampling_all_gpus_freq", 200))
-        sync_across_ranks = frequency > 0 and (iteration + 1) % frequency == 0
+        save_interval = int(self.cfg.get("save_interval", 0))
+        periodic_sync = frequency > 0 and (iteration + 1) % frequency == 0
+        save_boundary_sync = save_interval > 0 and iteration % save_interval == 0
+        sync_across_ranks = periodic_sync or save_boundary_sync or force_sync
         command.sync_and_compute_adaptive_sampling(sync_across_ranks=sync_across_ranks)
 
     def _resample_motion_working_set(self, iteration: int, obs):
@@ -129,7 +132,8 @@ class MotionOnPolicyRunner(OnPolicyRunner):
                 self.alg.compute_returns(obs)
 
             loss_dict = self.alg.update()
-            self._sync_adaptive_sampling(it)
+            is_final_iteration = total_it is not None and it == total_it - 1
+            self._sync_adaptive_sampling(it, force_sync=is_final_iteration)
             obs = self._resample_motion_working_set(it, obs)
 
             stop = time.time()
@@ -190,6 +194,6 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         command = self._motion_command()
         adaptive_state = checkpoint_infos.get("motion_adaptive_sampling")
         if command is not None and adaptive_state is not None and command.load_adaptive_sampling_state(adaptive_state):
-            if command.resample_motion_working_set():
-                self.env.reset()
+            command.resample_motion_working_set()
+            self.env.reset()
         return checkpoint_infos.get("runner_infos")
