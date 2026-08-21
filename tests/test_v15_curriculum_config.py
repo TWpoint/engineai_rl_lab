@@ -24,7 +24,6 @@ def test_v15_only_changes_the_reviewed_curriculum_controls() -> None:
         "curriculum_shadow_iterations": 100,
         "curriculum_blend_iterations": 50,
         "curriculum_min_known_fraction": 0.05,
-        "curriculum_motion_length_exponent": 0.5,
         "curriculum_min_terminal_visits": 32,
         "curriculum_quarantine_terminal_hazard_threshold": 0.10,
         "curriculum_terminal_hazard_window_bins": 2,
@@ -32,6 +31,8 @@ def test_v15_only_changes_the_reviewed_curriculum_controls() -> None:
         "curriculum_probability_smoothing_alpha": 0.2,
         "curriculum_detailed_metrics": False,
     }
+    assert v15["commands"]["motion"]["curriculum_motion_length_exponent"] == 1.0
+    assert v14["commands"]["motion"]["curriculum_motion_length_exponent"] == 1.0
     for name, value in expected_changes.items():
         assert v15["commands"]["motion"][name] == value
         v14["commands"]["motion"][name] = value

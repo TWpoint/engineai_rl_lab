@@ -1389,11 +1389,16 @@ class MotionCommand(CommandTerm):
         saved_states = saved_states.to(device=self.device, dtype=torch.uint8)
         if torch.any(saved_states >= len(self._CURRICULUM_STATE_NAMES)):
             return legacy_probabilities.float(), None, 1.0, False
-        source_exponent = (
-            1.0
-            if schema_version == self._CURRICULUM_STATE_SCHEMA_VERSION
-            else float(getattr(self.cfg, "curriculum_motion_length_exponent", 1.0))
-        )
+        if schema_version == self._CURRICULUM_STATE_SCHEMA_VERSION:
+            # V14/schema2 assigned equal probability to every bin.
+            source_exponent = 1.0
+        elif schema_version == self._CURRICULUM_BIASED_FIXED_HORIZON_SCHEMA_VERSION:
+            # The original V15/schema3 sampler tempered aggregate motion mass
+            # by square-root length. Reconstruct that historical endpoint even
+            # when the current V15 target has returned to equal-bin sampling.
+            source_exponent = 0.5
+        else:
+            source_exponent = float(getattr(self.cfg, "curriculum_motion_length_exponent", 1.0))
         source_curriculum = self._curriculum_state_budget_probabilities(
             all_bin_ids,
             dtype=legacy_probabilities.dtype,

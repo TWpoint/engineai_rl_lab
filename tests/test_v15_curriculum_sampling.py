@@ -10,7 +10,7 @@ def _v15_command():
     command = _curriculum_command()
     command.cfg.curriculum_start_horizon_frames = 4
     command.cfg.curriculum_exclude_invalid_failures = True
-    command.cfg.curriculum_motion_length_exponent = 0.5
+    command.cfg.curriculum_motion_length_exponent = 1.0
     command.cfg.curriculum_min_terminal_visits = 8
     command.cfg.curriculum_quarantine_terminal_hazard_threshold = 0.10
     command.cfg.curriculum_terminal_hazard_window_bins = 2
@@ -47,7 +47,7 @@ def test_failure_before_horizon_is_a_single_failed_start_outcome(monkeypatch: py
     assert command._current_curriculum_start_censored.sum().item() == 0.0
 
 
-def test_reaching_horizon_records_success_and_later_failure_does_not_backpropagate(
+def test_reaching_horizon_records_success_without_ending_episode_and_later_failure_does_not_backpropagate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     command = _v15_command()
@@ -59,6 +59,17 @@ def test_reaching_horizon_records_success_and_later_failure_does_not_backpropaga
     assert command._current_curriculum_start_trials[0].item() == 1.0
     assert command._current_curriculum_start_failures.sum().item() == 0.0
     assert command._episode_start_outcome_recorded[0].item()
+    assert command._has_sampled[0].item()
+    assert command._episode_start_bins[0].item() == 0
+    assert command.time_steps[0].item() == 3
+
+    # The same episode continues past the horizon. A later exposure must not
+    # create another start outcome or resample the motion.
+    command.time_steps[0] = 4
+    command._update_adaptive_exposure()
+    assert command._current_curriculum_start_trials[0].item() == 1.0
+    assert command._has_sampled[0].item()
+    assert command._episode_start_bins[0].item() == 0
 
     command._env.termination_manager.terminated[0] = True
     command._env.termination_manager.body_pos[0] = True
@@ -238,7 +249,7 @@ def test_quarantine_requires_forward_local_terminal_hazard() -> None:
     assert command._curriculum_states[bin_id].item() == command._CURRICULUM_QUARANTINE
 
 
-def test_state_motion_bin_sampling_tempers_length_by_square_root() -> None:
+def test_state_motion_bin_sampling_preserves_linear_bin_count_exposure() -> None:
     command = _v15_command()
     command.global_num_motions = 2
     command.bin_motion_ids[:] = torch.tensor([0, 0, 0, 0, 1])
@@ -247,11 +258,11 @@ def test_state_motion_bin_sampling_tempers_length_by_square_root() -> None:
     probabilities = command._curriculum_state_budget_probabilities(command._active_bin_ids, dtype=torch.float64)
 
     torch.testing.assert_close(probabilities.sum(), torch.tensor(1.0, dtype=torch.float64))
-    # Frontier keeps its explicit 55% budget and is length-tempered 2:1
-    # between the two motions.  Budgets for the four absent states become 45%
-    # uniform replay over all five bins.
-    expected_first_motion_mass = 0.55 * (2.0 / 3.0) + 0.45 * (4.0 / 5.0)
-    expected_second_motion_mass = 0.55 * (1.0 / 3.0) + 0.45 * (1.0 / 5.0)
+    # The first motion has four times as many bins, so it receives four times
+    # the total mass while every bin keeps the same base exposure. The
+    # absent-state replay is also uniform per bin and preserves the ratio.
+    expected_first_motion_mass = 4.0 / 5.0
+    expected_second_motion_mass = 1.0 / 5.0
     torch.testing.assert_close(probabilities[:4].sum(), torch.tensor(expected_first_motion_mass, dtype=torch.float64))
     torch.testing.assert_close(probabilities[4], torch.tensor(expected_second_motion_mass, dtype=torch.float64))
     torch.testing.assert_close(
@@ -358,6 +369,11 @@ def test_v15_fixed_horizon_state_round_trip() -> None:
 
 def test_schema3_upgrade_preserves_sufficient_statistics_but_resets_the_classifier() -> None:
     source = _v15_command()
+    # Schema 3 was produced by the original V15 configuration, which used
+    # square-root motion weighting. Migration must reconstruct that historical
+    # sampler even though the corrected V15 target is now linear in length.
+    source.cfg.curriculum_motion_length_exponent = 0.5
+    source.cfg.curriculum_preserve_absent_state_budgets = False
     source.cfg.adp_samp_failure_rate_max_over_mean = None
     source.cfg.curriculum_probability_smoothing_alpha = 1.0
     source.curriculum_start_trials[:] = torch.arange(5, dtype=torch.float32) + 32.0
@@ -368,7 +384,9 @@ def test_schema3_upgrade_preserves_sufficient_statistics_but_resets_the_classifi
     source.curriculum_terminal_visits[:] = torch.arange(5, dtype=torch.float32) + 64.0
     source.curriculum_terminal_failures[:] = torch.arange(5, dtype=torch.float32)
     source.curriculum_terminal_body_failures[:] = torch.tensor([3.0, 7.0])
-    source._curriculum_states[:] = torch.arange(5, dtype=torch.uint8)
+    source.global_num_motions = 2
+    source.bin_motion_ids[:] = torch.tensor([0, 0, 0, 0, 1])
+    source._curriculum_states.fill_(source._CURRICULUM_FRONTIER)
     source._curriculum_failure_rate_history.fill_(0.9)
     source._curriculum_iteration = 200
     source._curriculum_blend_start_iteration = 100
@@ -387,6 +405,8 @@ def test_schema3_upgrade_preserves_sufficient_statistics_but_resets_the_classifi
     }
     schema3_state["curriculum_state_schema_version"] = torch.tensor(3)
     restored = _v15_command()
+    restored.global_num_motions = 2
+    restored.bin_motion_ids[:] = source.bin_motion_ids
 
     assert restored.load_adaptive_sampling_state(schema3_state)
 
