@@ -28,6 +28,8 @@ def test_v15_only_changes_the_reviewed_curriculum_controls() -> None:
         "curriculum_min_terminal_visits": 32,
         "curriculum_quarantine_terminal_hazard_threshold": 0.10,
         "curriculum_terminal_hazard_window_bins": 2,
+        "curriculum_preserve_absent_state_budgets": True,
+        "curriculum_probability_smoothing_alpha": 0.2,
         "curriculum_detailed_metrics": False,
     }
     for name, value in expected_changes.items():

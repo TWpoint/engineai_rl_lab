@@ -53,6 +53,8 @@ def _curriculum_command() -> SimpleNamespace:
         curriculum_min_terminal_visits=0,
         curriculum_quarantine_terminal_hazard_threshold=0.0,
         curriculum_terminal_hazard_window_bins=1,
+        curriculum_preserve_absent_state_budgets=False,
+        curriculum_probability_smoothing_alpha=1.0,
         curriculum_detailed_metrics=True,
         curriculum_state_sampling_weights={
             "unknown": 0.20,
@@ -115,6 +117,7 @@ def _curriculum_command() -> SimpleNamespace:
         "_CURRICULUM_STALLED",
         "_CURRICULUM_QUARANTINE",
         "_CURRICULUM_STATE_SCHEMA_VERSION",
+        "_CURRICULUM_BIASED_FIXED_HORIZON_SCHEMA_VERSION",
         "_CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION",
     ):
         setattr(command, constant_name, getattr(MotionCommand, constant_name))
@@ -132,13 +135,16 @@ def _curriculum_command() -> SimpleNamespace:
         "_apply_probability_caps",
         "_curriculum_blend_factor",
         "_curriculum_state_budget_probabilities",
+        "_curriculum_shadow_distribution",
         "_blend_curriculum_distribution",
+        "_smooth_curriculum_distribution",
         "_update_curriculum_metrics",
         "_curriculum_known_mask",
         "_curriculum_forward_terminal_hard_mask",
         "_update_curriculum_states",
         "_flush_curriculum_statistics",
         "_advance_curriculum_sampling",
+        "_legacy_sampling_probabilities",
         "_rebuild_global_sampling_distribution",
         "_rebuild_sampling_distribution",
         "_record_curriculum_start_outcomes",
@@ -146,6 +152,7 @@ def _curriculum_command() -> SimpleNamespace:
         "_update_adaptive_exposure",
         "_reset_curriculum_sampling_state",
         "get_adaptive_sampling_state",
+        "_checkpoint_curriculum_distribution",
         "load_adaptive_sampling_state",
     ):
         setattr(command, method_name, MethodType(getattr(MotionCommand, method_name), command))

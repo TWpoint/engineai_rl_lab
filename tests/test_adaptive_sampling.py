@@ -72,6 +72,7 @@ def _command(*, active_global_ids: tuple[int, ...] = (0, 1)) -> SimpleNamespace:
         "_clip_failure_rate",
         "_configured_probability_cap",
         "_apply_probability_caps",
+        "_legacy_sampling_probabilities",
         "_rebuild_global_sampling_distribution",
         "_rebuild_sampling_distribution",
         "_update_adaptive_exposure",

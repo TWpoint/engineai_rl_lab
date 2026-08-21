@@ -40,7 +40,8 @@ class MotionCommand(CommandTerm):
     _CURRICULUM_STALLED = 3
     _CURRICULUM_QUARANTINE = 4
     _CURRICULUM_STATE_SCHEMA_VERSION = 2
-    _CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION = 3
+    _CURRICULUM_BIASED_FIXED_HORIZON_SCHEMA_VERSION = 3
+    _CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION = 4
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -231,6 +232,9 @@ class MotionCommand(CommandTerm):
             raise ValueError("curriculum_quarantine_terminal_hazard_threshold must be in [0, 1]")
         if int(getattr(self.cfg, "curriculum_terminal_hazard_window_bins", 1)) < 1:
             raise ValueError("curriculum_terminal_hazard_window_bins must be positive")
+        probability_smoothing_alpha = float(getattr(self.cfg, "curriculum_probability_smoothing_alpha", 1.0))
+        if not 0.0 < probability_smoothing_alpha <= 1.0:
+            raise ValueError("curriculum_probability_smoothing_alpha must be in (0, 1]")
 
     def _initialize_adaptive_sampling(self) -> None:
         motion_lengths = self._global_time_totals
@@ -312,6 +316,16 @@ class MotionCommand(CommandTerm):
         self._curriculum_last_state_update_iteration = 0
         self._curriculum_blend_start_iteration = -1
         self._curriculum_known_fraction = 0.0
+        self._curriculum_shadow_probabilities = zeros()
+        self._curriculum_smoothed_probabilities = zeros()
+        self._curriculum_shadow_states = torch.full(
+            (self.bin_count,), self._CURRICULUM_UNKNOWN, dtype=torch.uint8, device=self.device
+        )
+        self._curriculum_shadow_motion_length_exponent = 1.0
+        self._curriculum_has_shadow_distribution = False
+        self._curriculum_has_shadow_state_recipe = False
+        self._curriculum_smoothed_probabilities_initialized = False
+        self._curriculum_last_probability_smoothing_iteration = -1
         self._curriculum_metric_values: dict[str, torch.Tensor] = {}
 
     def _load_motion_collection(self, selected_global_ids: torch.Tensor) -> MotionCollection:
@@ -625,20 +639,37 @@ class MotionCommand(CommandTerm):
         return min(max(elapsed / blend_iterations, 0.0), 1.0)
 
     def _curriculum_state_budget_probabilities(
-        self, active_bin_ids: torch.Tensor, *, dtype: torch.dtype
+        self,
+        active_bin_ids: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        states: torch.Tensor | None = None,
+        motion_length_exponent: float | None = None,
+        preserve_absent_state_budgets: bool | None = None,
     ) -> torch.Tensor:
         """Assign fixed state budgets, optionally tempering motion length within each state."""
 
-        active_states = self._curriculum_states[active_bin_ids].long()
+        if states is None:
+            states = self._curriculum_states
+        active_states = states[active_bin_ids].long()
         state_counts = torch.bincount(active_states, minlength=len(self._CURRICULUM_STATE_NAMES)).to(dtype=dtype)
         state_weights = torch.tensor(
             [self.cfg.curriculum_state_sampling_weights[name] for name in self._CURRICULUM_STATE_NAMES],
             dtype=dtype,
             device=self.device,
         )
-        state_weights *= state_counts > 0
         state_weights /= state_weights.sum()
-        motion_length_exponent = float(getattr(self.cfg, "curriculum_motion_length_exponent", 1.0))
+        state_is_present = state_counts > 0
+        if preserve_absent_state_budgets is None:
+            preserve_absent_state_budgets = bool(getattr(self.cfg, "curriculum_preserve_absent_state_budgets", False))
+        if preserve_absent_state_budgets:
+            absent_state_weight = state_weights[~state_is_present].sum()
+        else:
+            state_weights *= state_is_present
+            state_weights /= state_weights.sum()
+            absent_state_weight = state_weights.new_zeros(())
+        if motion_length_exponent is None:
+            motion_length_exponent = float(getattr(self.cfg, "curriculum_motion_length_exponent", 1.0))
         if motion_length_exponent != 1.0:
             active_motion_ids = self.bin_motion_ids[active_bin_ids]
             state_motion_ids = active_states * self.global_num_motions + active_motion_ids
@@ -655,27 +686,75 @@ class MotionCommand(CommandTerm):
             probability_per_group = (
                 state_weights[active_states] * active_group_weights / state_group_weight_sums[active_states]
             )
-            return probability_per_group * active_bin_lengths / active_group_frame_counts
-        probability_per_bin = state_weights / state_counts.clamp_min(1.0)
-        return probability_per_bin[active_states]
+            probabilities = probability_per_group * active_bin_lengths / active_group_frame_counts
+        else:
+            probability_per_bin = state_weights / state_counts.clamp_min(1.0)
+            probabilities = probability_per_bin[active_states]
+        if preserve_absent_state_budgets:
+            probabilities = probabilities + absent_state_weight / max(len(active_bin_ids), 1)
+        return probabilities / probabilities.sum()
+
+    def _curriculum_shadow_distribution(
+        self, legacy_probabilities: torch.Tensor, active_bin_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the frozen source sampler conditioned on the active working set."""
+
+        if not self._curriculum_has_shadow_distribution:
+            return legacy_probabilities
+        if self._curriculum_has_shadow_state_recipe:
+            shadow = self._curriculum_state_budget_probabilities(
+                active_bin_ids,
+                dtype=legacy_probabilities.dtype,
+                states=self._curriculum_shadow_states,
+                motion_length_exponent=self._curriculum_shadow_motion_length_exponent,
+                preserve_absent_state_budgets=False,
+            )
+            if self.cfg.adp_samp_failure_rate_max_over_mean is not None:
+                shadow = self._cap_probabilities_at_uniform_ratio(
+                    shadow, float(self.cfg.adp_samp_failure_rate_max_over_mean)
+                )
+            return shadow / shadow.sum()
+        shadow = self._curriculum_shadow_probabilities[active_bin_ids].to(dtype=legacy_probabilities.dtype)
+        shadow_mass = shadow.sum()
+        return shadow / shadow_mass
 
     def _blend_curriculum_distribution(
         self, legacy_probabilities: torch.Tensor, active_bin_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Blend from the restored v13 sampler into the start-state curriculum."""
+        """Blend from the exact restored sampler into the start-state curriculum."""
 
         blend = self._curriculum_blend_factor()
+        shadow_probabilities = self._curriculum_shadow_distribution(legacy_probabilities, active_bin_ids)
         if blend <= 0.0:
-            return legacy_probabilities
+            return shadow_probabilities
         curriculum_probabilities = self._curriculum_state_budget_probabilities(
             active_bin_ids, dtype=legacy_probabilities.dtype
         )
-        probabilities = legacy_probabilities.lerp(curriculum_probabilities, blend)
+        probabilities = shadow_probabilities.lerp(curriculum_probabilities, blend)
         if self.cfg.adp_samp_failure_rate_max_over_mean is not None:
             probabilities = self._cap_probabilities_at_uniform_ratio(
                 probabilities, float(self.cfg.adp_samp_failure_rate_max_over_mean)
             )
         return probabilities / probabilities.sum()
+
+    def _smooth_curriculum_distribution(self, probabilities: torch.Tensor, *, advance: bool = True) -> torch.Tensor:
+        """Smooth one full-dataset probability transition per PPO iteration."""
+
+        alpha = float(getattr(self.cfg, "curriculum_probability_smoothing_alpha", 1.0))
+        current = self._curriculum_smoothed_probabilities
+        should_initialize = not self._curriculum_smoothed_probabilities_initialized
+        should_advance = advance and (
+            self._curriculum_last_probability_smoothing_iteration != self._curriculum_iteration
+        )
+        if should_initialize or alpha >= 1.0:
+            current.copy_(probabilities.to(dtype=current.dtype))
+        elif should_advance:
+            current.lerp_(probabilities.to(dtype=current.dtype), alpha)
+        if should_initialize or should_advance:
+            current.div_(current.sum())
+            self._curriculum_smoothed_probabilities_initialized = True
+            self._curriculum_last_probability_smoothing_iteration = self._curriculum_iteration
+        return current.to(dtype=probabilities.dtype)
 
     def _update_curriculum_metrics(self, active_bin_ids: torch.Tensor, probabilities: torch.Tensor) -> None:
         if not self._curriculum_sampling_enabled() or "curriculum_known_fraction" not in self.metrics:
@@ -735,10 +814,7 @@ class MotionCommand(CommandTerm):
 
     def _curriculum_known_mask(self) -> torch.Tensor:
         start_known = self.curriculum_start_trials >= float(self.cfg.curriculum_min_known_trials)
-        if not self._curriculum_fixed_horizon_enabled():
-            return start_known
-        terminal_known = self.curriculum_terminal_visits >= float(self.cfg.curriculum_min_terminal_visits)
-        return start_known | terminal_known
+        return start_known
 
     def _curriculum_forward_terminal_hard_mask(self) -> torch.Tensor:
         """Identify bins followed immediately by a locally high terminal hazard."""
@@ -772,16 +848,13 @@ class MotionCommand(CommandTerm):
         start_known = self.curriculum_start_trials >= float(self.cfg.curriculum_min_known_trials)
         valid_start = complete_start_window & start_known
         if self._curriculum_fixed_horizon_enabled():
-            terminal_known = self.curriculum_terminal_visits >= float(self.cfg.curriculum_min_terminal_visits)
-            valid_terminal = ~valid_start & terminal_known
-            terminal_failure_rate = (self.curriculum_terminal_failures + prior_alpha) / (
-                self.curriculum_terminal_visits + prior_alpha + prior_beta
-            )
-            failure_rate = torch.where(valid_start, start_failure_rate, terminal_failure_rate)
-            valid = valid_start | valid_terminal
-            known = valid & (start_known | terminal_known)
+            # Fixed-horizon state labels are comparable only when they come
+            # from fixed-horizon start outcomes.  Cumulative terminal hazard is
+            # retained solely as a local stalled->quarantine safety gate.
+            failure_rate = start_failure_rate
+            valid = valid_start
+            known = valid_start
         else:
-            valid_terminal = torch.zeros_like(valid_start)
             failure_rate = start_failure_rate
             valid = complete_start_window
             known = valid & start_known
@@ -926,26 +999,34 @@ class MotionCommand(CommandTerm):
         ):
             self._curriculum_blend_start_iteration = self._curriculum_iteration
 
-    def _rebuild_global_sampling_distribution(self) -> None:
+    def _legacy_sampling_probabilities(self, bin_ids: torch.Tensor) -> torch.Tensor:
+        """Build the pre-curriculum adaptive distribution on a bin subset."""
+
+        failure_rate = self._compute_failure_rate()[bin_ids]
+        if self.cfg.adaptive_sampling_alpha is not None:
+            return self._marmot_probabilities(failure_rate)
+        failure_rate = self._clip_failure_rate(failure_rate).double()
+        if failure_rate.sum() <= 0.0:
+            failure_probabilities = torch.full_like(failure_rate, 1.0 / max(len(failure_rate), 1))
+        else:
+            failure_probabilities = failure_rate / failure_rate.sum()
+        uniform_probabilities = torch.ones_like(failure_probabilities) / max(len(failure_probabilities), 1)
+        probabilities = (
+            failure_probabilities * (1.0 - self.cfg.uniform_sampling_rate)
+            + uniform_probabilities * self.cfg.uniform_sampling_rate
+        )
+        probabilities *= self.bin_weights[bin_ids]
+        probabilities /= probabilities.sum()
+        return self._apply_probability_caps(probabilities, bin_ids)
+
+    def _rebuild_global_sampling_distribution(self, *, advance_curriculum_smoothing: bool = True) -> None:
         """Match SONIC's full-dataset distribution used to draw a working set."""
 
-        failure_rate = self._compute_failure_rate()
         all_bin_ids = torch.arange(self.bin_count, device=self.device)
-        if self.cfg.adaptive_sampling_alpha is not None:
-            probabilities = self._marmot_probabilities(failure_rate)
-        else:
-            failure_rate = self._clip_failure_rate(failure_rate).double()
-            failure_probabilities = failure_rate / failure_rate.sum()
-            uniform_probabilities = torch.ones_like(failure_probabilities) / self.bin_count
-            probabilities = (
-                failure_probabilities * (1.0 - self.cfg.uniform_sampling_rate)
-                + uniform_probabilities * self.cfg.uniform_sampling_rate
-            )
-            probabilities *= self.bin_weights
-            probabilities /= probabilities.sum()
-            probabilities = self._apply_probability_caps(probabilities, all_bin_ids)
+        probabilities = self._legacy_sampling_probabilities(all_bin_ids)
         if getattr(self.cfg, "curriculum_sampling_enabled", False):
             probabilities = self._blend_curriculum_distribution(probabilities, all_bin_ids)
+            probabilities = self._smooth_curriculum_distribution(probabilities, advance=advance_curriculum_smoothing)
         self.adp_sampling_prob = probabilities.float()
         motion_sampling_probabilities = torch.zeros(self.global_num_motions, dtype=torch.float32, device=self.device)
         motion_sampling_probabilities.index_add_(0, self.bin_motion_ids, self.adp_sampling_prob)
@@ -954,22 +1035,22 @@ class MotionCommand(CommandTerm):
     def _rebuild_sampling_distribution(self) -> None:
         """Match SONIC's adaptive distribution over the active working set."""
 
-        active_failure_rate = self._compute_failure_rate()[self._active_bin_ids]
-        if self.cfg.adaptive_sampling_alpha is not None:
-            probabilities = self._marmot_probabilities(active_failure_rate)
-        else:
-            active_failure_rate = self._clip_failure_rate(active_failure_rate.double())
-            failure_probabilities = active_failure_rate / active_failure_rate.sum()
-            uniform_probabilities = torch.ones_like(failure_probabilities) / len(failure_probabilities)
-            probabilities = (
-                failure_probabilities * (1.0 - self.cfg.uniform_sampling_rate)
-                + uniform_probabilities * self.cfg.uniform_sampling_rate
-            )
-            probabilities *= self.bin_weights[self._active_bin_ids]
+        if (
+            getattr(self.cfg, "curriculum_sampling_enabled", False)
+            and self._curriculum_fixed_horizon_enabled()
+            and self._curriculum_smoothed_probabilities_initialized
+            and self._curriculum_blend_factor() > 0.0
+        ):
+            probabilities = self.adp_sampling_prob[self._active_bin_ids].double()
             probabilities /= probabilities.sum()
-            probabilities = self._apply_probability_caps(probabilities, self._active_bin_ids)
-        if getattr(self.cfg, "curriculum_sampling_enabled", False):
-            probabilities = self._blend_curriculum_distribution(probabilities, self._active_bin_ids)
+            if self.cfg.adp_samp_failure_rate_max_over_mean is not None:
+                probabilities = self._cap_probabilities_at_uniform_ratio(
+                    probabilities, float(self.cfg.adp_samp_failure_rate_max_over_mean)
+                )
+        else:
+            probabilities = self._legacy_sampling_probabilities(self._active_bin_ids)
+            if getattr(self.cfg, "curriculum_sampling_enabled", False):
+                probabilities = self._blend_curriculum_distribution(probabilities, self._active_bin_ids)
         if not torch.all(torch.isfinite(probabilities)) or torch.any(probabilities < 0.0):
             raise RuntimeError("Adaptive motion sampling produced invalid probabilities")
         self.adp_sampling_active_prob = probabilities.float()
@@ -1286,6 +1367,67 @@ class MotionCommand(CommandTerm):
         self._rebuild_global_sampling_distribution()
         self._rebuild_sampling_distribution()
 
+    def _checkpoint_curriculum_distribution(
+        self, state_dict: dict[str, torch.Tensor], schema_version: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None, float, bool]:
+        """Reconstruct the sampler active at a compatible older checkpoint."""
+
+        all_bin_ids = torch.arange(self.bin_count, device=self.device)
+        legacy_probabilities = self._legacy_sampling_probabilities(all_bin_ids)
+        saved_effective_probabilities = state_dict.get("curriculum_smoothed_probabilities")
+        if (
+            schema_version >= self._CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION
+            and isinstance(saved_effective_probabilities, torch.Tensor)
+            and saved_effective_probabilities.shape == self._curriculum_smoothed_probabilities.shape
+        ):
+            probabilities = saved_effective_probabilities.to(device=self.device, dtype=torch.float32)
+            if torch.all(torch.isfinite(probabilities)) and probabilities.sum() > 0.0:
+                return probabilities / probabilities.sum(), None, 1.0, False
+        saved_states = state_dict.get("curriculum_states")
+        if not isinstance(saved_states, torch.Tensor) or saved_states.shape != self._curriculum_states.shape:
+            return legacy_probabilities.float(), None, 1.0, False
+        saved_states = saved_states.to(device=self.device, dtype=torch.uint8)
+        if torch.any(saved_states >= len(self._CURRICULUM_STATE_NAMES)):
+            return legacy_probabilities.float(), None, 1.0, False
+        source_exponent = (
+            1.0
+            if schema_version == self._CURRICULUM_STATE_SCHEMA_VERSION
+            else float(getattr(self.cfg, "curriculum_motion_length_exponent", 1.0))
+        )
+        source_curriculum = self._curriculum_state_budget_probabilities(
+            all_bin_ids,
+            dtype=legacy_probabilities.dtype,
+            states=saved_states,
+            motion_length_exponent=source_exponent,
+            preserve_absent_state_budgets=False,
+        )
+        saved_iteration = state_dict.get("curriculum_iteration")
+        saved_blend_start = state_dict.get("curriculum_blend_start_iteration")
+        if (
+            not isinstance(saved_iteration, torch.Tensor)
+            or not isinstance(saved_blend_start, torch.Tensor)
+            or int(saved_blend_start.item()) < 0
+        ):
+            source_blend = 0.0
+        elif int(self.cfg.curriculum_blend_iterations) == 0:
+            source_blend = 1.0
+        else:
+            source_blend = min(
+                max(
+                    (int(saved_iteration.item()) - int(saved_blend_start.item()))
+                    / float(self.cfg.curriculum_blend_iterations),
+                    0.0,
+                ),
+                1.0,
+            )
+        probabilities = legacy_probabilities.lerp(source_curriculum, source_blend)
+        if self.cfg.adp_samp_failure_rate_max_over_mean is not None:
+            probabilities = self._cap_probabilities_at_uniform_ratio(
+                probabilities, float(self.cfg.adp_samp_failure_rate_max_over_mean)
+            )
+        probabilities /= probabilities.sum()
+        return probabilities.float(), saved_states, source_exponent, source_blend >= 1.0
+
     def get_adaptive_sampling_state(self) -> dict[str, torch.Tensor]:
         state = {
             "adp_samp_num_episodes": self.adp_samp_num_episodes.detach().cpu(),
@@ -1329,6 +1471,20 @@ class MotionCommand(CommandTerm):
                         int(self.cfg.curriculum_start_horizon_frames), dtype=torch.long
                     ),
                     "curriculum_start_censored": self.curriculum_start_censored.detach().cpu(),
+                    "curriculum_shadow_probabilities": self._curriculum_shadow_probabilities.detach().cpu(),
+                    "curriculum_smoothed_probabilities": self._curriculum_smoothed_probabilities.detach().cpu(),
+                    "curriculum_shadow_states": self._curriculum_shadow_states.detach().cpu(),
+                    "curriculum_shadow_motion_length_exponent": torch.tensor(
+                        self._curriculum_shadow_motion_length_exponent, dtype=torch.float32
+                    ),
+                    "curriculum_has_shadow_distribution": torch.tensor(self._curriculum_has_shadow_distribution),
+                    "curriculum_has_shadow_state_recipe": torch.tensor(self._curriculum_has_shadow_state_recipe),
+                    "curriculum_smoothed_probabilities_initialized": torch.tensor(
+                        self._curriculum_smoothed_probabilities_initialized
+                    ),
+                    "curriculum_last_probability_smoothing_iteration": torch.tensor(
+                        self._curriculum_last_probability_smoothing_iteration, dtype=torch.long
+                    ),
                 }
             )
         return state
@@ -1358,6 +1514,9 @@ class MotionCommand(CommandTerm):
             tensor.zero_()
         self._curriculum_failure_rate_history.fill_(float("nan"))
         self._curriculum_states.fill_(self._CURRICULUM_UNKNOWN)
+        self._curriculum_shadow_probabilities.zero_()
+        self._curriculum_smoothed_probabilities.zero_()
+        self._curriculum_shadow_states.fill_(self._CURRICULUM_UNKNOWN)
         self._episode_start_bins.fill_(-1)
         self._episode_start_frames.zero_()
         self._episode_last_visited_bins.fill_(-1)
@@ -1367,6 +1526,11 @@ class MotionCommand(CommandTerm):
         self._curriculum_last_state_update_iteration = 0
         self._curriculum_blend_start_iteration = -1
         self._curriculum_known_fraction = 0.0
+        self._curriculum_shadow_motion_length_exponent = 1.0
+        self._curriculum_has_shadow_distribution = False
+        self._curriculum_has_shadow_state_recipe = False
+        self._curriculum_smoothed_probabilities_initialized = False
+        self._curriculum_last_probability_smoothing_iteration = -1
         self._curriculum_metric_values = {}
 
     def load_adaptive_sampling_state(self, state_dict: dict[str, torch.Tensor]) -> bool:
@@ -1384,6 +1548,7 @@ class MotionCommand(CommandTerm):
         # The environment is freshly reset after a restore.  Do not let the
         # construction-time episodes contaminate either legacy or v14 stats.
         self._has_sampled.zero_()
+        exact_probability_state_restored = False
         if getattr(self.cfg, "curriculum_sampling_enabled", False):
             schema_value = state_dict.get("curriculum_state_schema_version")
             schema_version = int(schema_value.item()) if isinstance(schema_value, torch.Tensor) else 1
@@ -1441,14 +1606,36 @@ class MotionCommand(CommandTerm):
                         "curriculum_start_censored": self.curriculum_start_censored,
                     }
                 )
-            counters_present = all(
-                isinstance(state_dict.get(name), torch.Tensor)
-                for name in (
-                    "curriculum_iteration",
-                    "curriculum_last_state_update_iteration",
-                    "curriculum_blend_start_iteration",
+                expected_shapes.update(
+                    {
+                        "curriculum_shadow_probabilities": self._curriculum_shadow_probabilities.shape,
+                        "curriculum_smoothed_probabilities": self._curriculum_smoothed_probabilities.shape,
+                        "curriculum_shadow_states": self._curriculum_shadow_states.shape,
+                    }
                 )
-            )
+                restored_tensors.update(
+                    {
+                        "curriculum_shadow_probabilities": self._curriculum_shadow_probabilities,
+                        "curriculum_smoothed_probabilities": self._curriculum_smoothed_probabilities,
+                        "curriculum_shadow_states": self._curriculum_shadow_states,
+                    }
+                )
+            counter_names = [
+                "curriculum_iteration",
+                "curriculum_last_state_update_iteration",
+                "curriculum_blend_start_iteration",
+            ]
+            if runtime_schema_version >= self._CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION:
+                counter_names.extend(
+                    [
+                        "curriculum_shadow_motion_length_exponent",
+                        "curriculum_has_shadow_distribution",
+                        "curriculum_has_shadow_state_recipe",
+                        "curriculum_smoothed_probabilities_initialized",
+                        "curriculum_last_probability_smoothing_iteration",
+                    ]
+                )
+            counters_present = all(isinstance(state_dict.get(name), torch.Tensor) for name in counter_names)
             exact_state_matches = (
                 schema_version == runtime_schema_version
                 and layout_matches
@@ -1472,11 +1659,33 @@ class MotionCommand(CommandTerm):
                         state_dict["curriculum_last_state_update_iteration"].item()
                     )
                     self._curriculum_blend_start_iteration = int(state_dict["curriculum_blend_start_iteration"].item())
+                    if runtime_schema_version >= self._CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION:
+                        self._curriculum_shadow_motion_length_exponent = float(
+                            state_dict["curriculum_shadow_motion_length_exponent"].item()
+                        )
+                        self._curriculum_has_shadow_distribution = bool(
+                            state_dict["curriculum_has_shadow_distribution"].item()
+                        )
+                        self._curriculum_has_shadow_state_recipe = bool(
+                            state_dict["curriculum_has_shadow_state_recipe"].item()
+                        )
+                        self._curriculum_smoothed_probabilities_initialized = bool(
+                            state_dict["curriculum_smoothed_probabilities_initialized"].item()
+                        )
+                        self._curriculum_last_probability_smoothing_iteration = int(
+                            state_dict["curriculum_last_probability_smoothing_iteration"].item()
+                        )
+                        exact_probability_state_restored = True
                     known = self._curriculum_known_mask()
                     self._curriculum_known_fraction = float(known.float().mean().item())
             elif (
                 runtime_schema_version >= self._CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION
-                and schema_version in (self._CURRICULUM_STATE_SCHEMA_VERSION, runtime_schema_version)
+                and schema_version
+                in (
+                    self._CURRICULUM_STATE_SCHEMA_VERSION,
+                    self._CURRICULUM_BIASED_FIXED_HORIZON_SCHEMA_VERSION,
+                    runtime_schema_version,
+                )
                 and layout_matches
             ):
                 terminal_names = (
@@ -1489,14 +1698,57 @@ class MotionCommand(CommandTerm):
                     and state_dict[name].shape == restored_tensors[name].shape
                     for name in terminal_names
                 )
+                shadow_probabilities, shadow_states, shadow_exponent, shadow_uses_state_recipe = (
+                    self._checkpoint_curriculum_distribution(state_dict, schema_version)
+                )
+                saved_horizon = state_dict.get("curriculum_start_horizon_frames")
+                can_preserve_fixed_horizon_start = (
+                    schema_version == self._CURRICULUM_BIASED_FIXED_HORIZON_SCHEMA_VERSION
+                    and isinstance(saved_horizon, torch.Tensor)
+                    and int(saved_horizon.item()) == int(self.cfg.curriculum_start_horizon_frames)
+                )
+                fixed_horizon_sufficient_names = (
+                    "curriculum_start_trials",
+                    "curriculum_start_failures",
+                    "curriculum_start_censored",
+                    "curriculum_start_survival_steps",
+                    "curriculum_start_completion_fraction",
+                )
+                fixed_horizon_state_matches = can_preserve_fixed_horizon_start and all(
+                    isinstance(state_dict.get(name), torch.Tensor)
+                    and state_dict[name].shape == restored_tensors[name].shape
+                    for name in fixed_horizon_sufficient_names
+                )
                 self._reset_curriculum_sampling_state()
                 if terminal_state_matches:
                     for name in terminal_names:
                         target = restored_tensors[name]
                         target.copy_(state_dict[name].to(device=self.device, dtype=target.dtype))
+                    if fixed_horizon_state_matches:
+                        for name in fixed_horizon_sufficient_names:
+                            target = restored_tensors[name]
+                            target.copy_(state_dict[name].to(device=self.device, dtype=target.dtype))
+                    self._curriculum_shadow_probabilities.copy_(shadow_probabilities)
+                    self._curriculum_smoothed_probabilities.copy_(shadow_probabilities)
+                    self._curriculum_has_shadow_distribution = True
+                    self._curriculum_smoothed_probabilities_initialized = True
+                    self._curriculum_last_probability_smoothing_iteration = 0
+                    if shadow_states is not None and shadow_uses_state_recipe:
+                        self._curriculum_shadow_states.copy_(shadow_states)
+                        self._curriculum_shadow_motion_length_exponent = shadow_exponent
+                        self._curriculum_has_shadow_state_recipe = True
                     known = self._curriculum_known_mask()
                     self._curriculum_known_fraction = float(known.float().mean().item())
-                    print("[INFO] Migrated terminal curriculum statistics; fixed-horizon start state begins in shadow.")
+                    if fixed_horizon_state_matches:
+                        print(
+                            "[INFO] Migrated fixed-horizon sufficient statistics; "
+                            "the corrected classifier restarts from the checkpoint sampler in shadow."
+                        )
+                    else:
+                        print(
+                            "[INFO] Migrated terminal curriculum statistics; "
+                            "fixed-horizon start state begins from the checkpoint sampler in shadow."
+                        )
                 else:
                     print("[WARN] Curriculum terminal state is incompatible; starting it in shadow mode.")
             else:
@@ -1505,7 +1757,7 @@ class MotionCommand(CommandTerm):
                 elif schema_version == runtime_schema_version:
                     print("[WARN] Curriculum state does not match the current dataset; starting it in shadow mode.")
                 self._reset_curriculum_sampling_state()
-        self._rebuild_global_sampling_distribution()
+        self._rebuild_global_sampling_distribution(advance_curriculum_smoothing=not exact_probability_state_restored)
         self._rebuild_sampling_distribution()
         return True
 
@@ -1740,6 +1992,12 @@ class MotionCommandCfg(CommandTermCfg):
     curriculum_min_terminal_visits: int = 0
     curriculum_quarantine_terminal_hazard_threshold: float = 0.0
     curriculum_terminal_hazard_window_bins: int = 1
+    # Preserve each configured state budget even when that state is empty;
+    # missing mass becomes uniform replay instead of amplifying other states.
+    curriculum_preserve_absent_state_budgets: bool = False
+    # EMA applied once per PPO iteration to the final full-dataset sampler.
+    # One preserves v14's immediate probability updates.
+    curriculum_probability_smoothing_alpha: float = 1.0
     curriculum_detailed_metrics: bool = True
     curriculum_state_sampling_weights: dict[str, float] = {
         "unknown": 0.20,

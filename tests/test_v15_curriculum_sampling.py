@@ -14,8 +14,12 @@ def _v15_command():
     command.cfg.curriculum_min_terminal_visits = 8
     command.cfg.curriculum_quarantine_terminal_hazard_threshold = 0.10
     command.cfg.curriculum_terminal_hazard_window_bins = 2
+    command.cfg.curriculum_preserve_absent_state_budgets = True
+    command.cfg.curriculum_probability_smoothing_alpha = 0.2
     command.cfg.curriculum_detailed_metrics = False
     command._reset_curriculum_sampling_state()
+    command._rebuild_global_sampling_distribution()
+    command._rebuild_sampling_distribution()
     return command
 
 
@@ -107,26 +111,33 @@ def test_invalid_failure_is_censored_and_excluded_from_local_failure_stats(
     assert command._current_curriculum_terminal_body_failures.sum().item() == 0.0
 
 
-def test_terminal_only_fallback_can_master_but_never_stall_or_quarantine() -> None:
+def test_terminal_only_evidence_keeps_fixed_horizon_start_unknown() -> None:
     command = _v15_command()
     bin_id = 4
-    command.curriculum_terminal_visits[bin_id] = 8.0
+    command.curriculum_terminal_visits[bin_id] = 128.0
+    command.curriculum_terminal_failures[bin_id] = 0.0
 
     for _ in range(4):
         command._update_curriculum_states()
 
-    assert command._curriculum_states[bin_id].item() == command._CURRICULUM_MASTERED
+    assert command._curriculum_states[bin_id].item() == command._CURRICULUM_UNKNOWN
+    assert not command._curriculum_known_mask()[bin_id].item()
+    assert torch.isnan(command._curriculum_failure_rate_history[:, bin_id]).all()
 
+
+def test_terminal_only_evidence_does_not_start_the_fixed_horizon_blend() -> None:
     command = _v15_command()
-    command.curriculum_terminal_visits[bin_id] = 32.0
-    command.curriculum_terminal_failures[bin_id] = 32.0
-    for _ in range(5):
-        command._update_curriculum_states()
+    command.cfg.curriculum_shadow_iterations = 0
+    command.cfg.curriculum_min_known_fraction = 0.01
+    command.curriculum_terminal_visits.fill_(128.0)
 
-    assert command._curriculum_states[bin_id].item() == command._CURRICULUM_FRONTIER
+    command._advance_curriculum_sampling(sync_across_ranks=False)
+
+    assert command._curriculum_known_fraction == 0.0
+    assert command._curriculum_blend_start_iteration == -1
 
 
-def test_terminal_fallback_does_not_consume_subthreshold_fixed_horizon_evidence() -> None:
+def test_terminal_evidence_does_not_override_subthreshold_fixed_horizon_evidence() -> None:
     command = _v15_command()
     command.cfg.curriculum_min_known_trials = 32
     bin_id = 2
@@ -134,18 +145,80 @@ def test_terminal_fallback_does_not_consume_subthreshold_fixed_horizon_evidence(
 
     _record_window(command, bin_id, trials=8, failures=8)
 
-    assert command._curriculum_states[bin_id].item() == command._CURRICULUM_FRONTIER
+    assert command._curriculum_states[bin_id].item() == command._CURRICULUM_UNKNOWN
     assert command._curriculum_window_start_trials[bin_id].item() == 8.0
 
     command._update_curriculum_states()
 
-    assert command._curriculum_states[bin_id].item() == command._CURRICULUM_MASTERED
+    assert command._curriculum_states[bin_id].item() == command._CURRICULUM_UNKNOWN
     assert command._curriculum_window_start_trials[bin_id].item() == 8.0
 
     _record_window(command, bin_id, trials=24, failures=24)
 
     assert command._curriculum_states[bin_id].item() == command._CURRICULUM_FRONTIER
     assert command._curriculum_window_start_trials[bin_id].item() == 0.0
+
+
+def test_missing_unknown_budget_becomes_uniform_replay_instead_of_frontier_mass() -> None:
+    command = _v15_command()
+    command._curriculum_states[:] = torch.tensor(
+        [
+            command._CURRICULUM_MASTERED,
+            command._CURRICULUM_FRONTIER,
+            command._CURRICULUM_STALLED,
+            command._CURRICULUM_QUARANTINE,
+            command._CURRICULUM_QUARANTINE,
+        ],
+        dtype=torch.uint8,
+    )
+
+    probabilities = command._curriculum_state_budget_probabilities(command._active_bin_ids, dtype=torch.float64)
+
+    # The absent unknown state's 20% budget is baseline replay over every bin.
+    # It must not be renormalized into the present states (which would give the
+    # single frontier bin 55 / 80 = 68.75% mass).
+    expected = torch.tensor([0.14, 0.59, 0.14, 0.065, 0.065], dtype=torch.float64)
+    torch.testing.assert_close(probabilities, expected)
+    assert probabilities[1].item() < 0.60
+
+
+def test_state_refresh_probability_change_is_smoothed_once_per_iteration() -> None:
+    command = _v15_command()
+    command.cfg.adp_samp_failure_rate_max_over_mean = None
+    command.cfg.curriculum_blend_iterations = 0
+    command._curriculum_blend_start_iteration = 0
+    command._curriculum_iteration = 1
+    before = command.adp_sampling_prob.clone()
+    command._curriculum_states[:] = torch.tensor(
+        [
+            command._CURRICULUM_UNKNOWN,
+            command._CURRICULUM_MASTERED,
+            command._CURRICULUM_FRONTIER,
+            command._CURRICULUM_STALLED,
+            command._CURRICULUM_QUARANTINE,
+        ],
+        dtype=torch.uint8,
+    )
+    raw_target = command._curriculum_state_budget_probabilities(command._active_bin_ids, dtype=torch.float64).float()
+
+    command._rebuild_global_sampling_distribution()
+
+    expected = before.lerp(raw_target, command.cfg.curriculum_probability_smoothing_alpha)
+    torch.testing.assert_close(command.adp_sampling_prob, expected)
+    assert not torch.allclose(command.adp_sampling_prob, raw_target)
+
+    # Rebuilding a working set in the same PPO iteration must not apply the EMA
+    # repeatedly and silently accelerate the transition.
+    after_first_rebuild = command.adp_sampling_prob.clone()
+    command._rebuild_global_sampling_distribution()
+    torch.testing.assert_close(command.adp_sampling_prob, after_first_rebuild)
+
+    command._curriculum_iteration += 1
+    command._rebuild_global_sampling_distribution()
+    torch.testing.assert_close(
+        command.adp_sampling_prob,
+        after_first_rebuild.lerp(raw_target, command.cfg.curriculum_probability_smoothing_alpha),
+    )
 
 
 def test_quarantine_requires_forward_local_terminal_hazard() -> None:
@@ -174,25 +247,50 @@ def test_state_motion_bin_sampling_tempers_length_by_square_root() -> None:
     probabilities = command._curriculum_state_budget_probabilities(command._active_bin_ids, dtype=torch.float64)
 
     torch.testing.assert_close(probabilities.sum(), torch.tensor(1.0, dtype=torch.float64))
-    torch.testing.assert_close(probabilities[:4].sum(), torch.tensor(2.0 / 3.0, dtype=torch.float64))
-    torch.testing.assert_close(probabilities[4], torch.tensor(1.0 / 3.0, dtype=torch.float64))
-    torch.testing.assert_close(probabilities[:4], torch.full((4,), 1.0 / 6.0, dtype=torch.float64))
+    # Frontier keeps its explicit 55% budget and is length-tempered 2:1
+    # between the two motions.  Budgets for the four absent states become 45%
+    # uniform replay over all five bins.
+    expected_first_motion_mass = 0.55 * (2.0 / 3.0) + 0.45 * (4.0 / 5.0)
+    expected_second_motion_mass = 0.55 * (1.0 / 3.0) + 0.45 * (1.0 / 5.0)
+    torch.testing.assert_close(probabilities[:4].sum(), torch.tensor(expected_first_motion_mass, dtype=torch.float64))
+    torch.testing.assert_close(probabilities[4], torch.tensor(expected_second_motion_mass, dtype=torch.float64))
+    torch.testing.assert_close(
+        probabilities[:4], torch.full((4,), expected_first_motion_mass / 4.0, dtype=torch.float64)
+    )
 
 
-def test_v14_schema_migrates_only_terminal_evidence_into_v15() -> None:
+def test_v14_schema_migration_preserves_the_actual_v14_shadow_distribution() -> None:
     v14 = _curriculum_command()
+    v14.cfg.adp_samp_failure_rate_max_over_mean = None
     v14.curriculum_start_trials.fill_(64.0)
     v14.curriculum_start_failures.fill_(60.0)
     v14.curriculum_terminal_visits[:] = torch.arange(5, dtype=torch.float32) + 30.0
     v14.curriculum_terminal_failures[:] = torch.arange(5, dtype=torch.float32)
     v14.curriculum_terminal_body_failures[:] = torch.tensor([3.0, 7.0])
-    v14._curriculum_states.fill_(v14._CURRICULUM_QUARANTINE)
+    v14._curriculum_states[:] = torch.tensor(
+        [
+            v14._CURRICULUM_MASTERED,
+            v14._CURRICULUM_FRONTIER,
+            v14._CURRICULUM_FRONTIER,
+            v14._CURRICULUM_STALLED,
+            v14._CURRICULUM_QUARANTINE,
+        ],
+        dtype=torch.uint8,
+    )
     v14._curriculum_iteration = 200
+    v14._curriculum_blend_start_iteration = 100
+    v14._rebuild_global_sampling_distribution()
+    v14_distribution = v14.adp_sampling_prob.clone()
+    assert not torch.allclose(v14_distribution, torch.full_like(v14_distribution, 0.2))
     state = v14.get_adaptive_sampling_state()
     v15 = _v15_command()
 
     assert v15.load_adaptive_sampling_state(state)
 
+    # The fixed-horizon classifier starts clean, but its shadow sampler must be
+    # the distribution that was actually active in V14, not a reconstructed
+    # V13/Marmot distribution from the legacy counters.
+    torch.testing.assert_close(v15.adp_sampling_prob, v14_distribution)
     assert v15.curriculum_start_trials.count_nonzero().item() == 0
     assert v15.curriculum_start_failures.count_nonzero().item() == 0
     assert torch.all(v15._curriculum_states == v15._CURRICULUM_UNKNOWN)
@@ -201,6 +299,32 @@ def test_v14_schema_migrates_only_terminal_evidence_into_v15() -> None:
     torch.testing.assert_close(v15.curriculum_terminal_visits, v14.curriculum_terminal_visits)
     torch.testing.assert_close(v15.curriculum_terminal_failures, v14.curriculum_terminal_failures)
     torch.testing.assert_close(v15.curriculum_terminal_body_failures, v14.curriculum_terminal_body_failures)
+
+    # A working-set distribution must be recomputed from the frozen V14
+    # state-budget recipe.  Slicing the global distribution changes the state
+    # budgets when the subset contains only part of a state's bins.
+    active_bin_ids = torch.tensor([0, 1], dtype=torch.long)
+    active_legacy = torch.tensor([0.8, 0.2], dtype=torch.float64)
+    expected_active = v14._blend_curriculum_distribution(active_legacy, active_bin_ids)
+    sliced_global = v14_distribution[active_bin_ids].double()
+    sliced_global /= sliced_global.sum()
+    assert not torch.allclose(expected_active, sliced_global)
+    actual_active = MotionCommand._curriculum_shadow_distribution(v15, active_legacy, active_bin_ids)
+    torch.testing.assert_close(actual_active, expected_active)
+
+    # A checkpoint taken partway through migration shadow must restore the
+    # frozen endpoint and schedule for both global and working-set rebuilds.
+    v15._curriculum_iteration = 50
+    v15._rebuild_global_sampling_distribution()
+    torch.testing.assert_close(v15.adp_sampling_prob, v14_distribution)
+    mid_shadow_state = v15.get_adaptive_sampling_state()
+    resumed = _v15_command()
+    assert resumed.load_adaptive_sampling_state(mid_shadow_state)
+    assert resumed._curriculum_iteration == 50
+    assert resumed._curriculum_blend_start_iteration == -1
+    torch.testing.assert_close(resumed.adp_sampling_prob, v15.adp_sampling_prob)
+    resumed_active = MotionCommand._curriculum_shadow_distribution(resumed, active_legacy, active_bin_ids)
+    torch.testing.assert_close(resumed_active, expected_active)
 
 
 def test_v15_fixed_horizon_state_round_trip() -> None:
@@ -212,16 +336,82 @@ def test_v15_fixed_horizon_state_round_trip() -> None:
     source._curriculum_iteration = 75
     source._curriculum_last_state_update_iteration = 50
     source._curriculum_blend_start_iteration = 50
+    source._curriculum_shadow_probabilities = torch.tensor([0.35, 0.25, 0.20, 0.15, 0.05])
+    source._curriculum_smoothed_probabilities = torch.tensor([0.10, 0.15, 0.20, 0.25, 0.30])
+    source._curriculum_last_probability_smoothing_iteration = 75
     state = source.get_adaptive_sampling_state()
     restored = _v15_command()
 
-    assert state["curriculum_state_schema_version"].item() == 3
+    assert state["curriculum_state_schema_version"].item() == 4
+    assert {
+        "curriculum_shadow_probabilities",
+        "curriculum_smoothed_probabilities",
+        "curriculum_last_probability_smoothing_iteration",
+    } <= state.keys()
     assert restored.load_adaptive_sampling_state(state)
 
     restored_state = restored.get_adaptive_sampling_state()
     assert restored_state.keys() == state.keys()
     for name in state:
         torch.testing.assert_close(restored_state[name], state[name], equal_nan=True)
+
+
+def test_schema3_upgrade_preserves_sufficient_statistics_but_resets_the_classifier() -> None:
+    source = _v15_command()
+    source.cfg.adp_samp_failure_rate_max_over_mean = None
+    source.cfg.curriculum_probability_smoothing_alpha = 1.0
+    source.curriculum_start_trials[:] = torch.arange(5, dtype=torch.float32) + 32.0
+    source.curriculum_start_failures[:] = torch.arange(5, dtype=torch.float32) + 4.0
+    source.curriculum_start_censored[:] = torch.arange(5, dtype=torch.float32) + 2.0
+    source.curriculum_start_survival_steps[:] = torch.arange(5, dtype=torch.float32) + 100.0
+    source.curriculum_start_completion_fraction[:] = torch.arange(5, dtype=torch.float32) / 10.0
+    source.curriculum_terminal_visits[:] = torch.arange(5, dtype=torch.float32) + 64.0
+    source.curriculum_terminal_failures[:] = torch.arange(5, dtype=torch.float32)
+    source.curriculum_terminal_body_failures[:] = torch.tensor([3.0, 7.0])
+    source._curriculum_states[:] = torch.arange(5, dtype=torch.uint8)
+    source._curriculum_failure_rate_history.fill_(0.9)
+    source._curriculum_iteration = 200
+    source._curriculum_blend_start_iteration = 100
+    source._rebuild_global_sampling_distribution()
+    source_distribution = source.adp_sampling_prob.clone()
+    state = source.get_adaptive_sampling_state()
+    schema3_state = {
+        name: value
+        for name, value in state.items()
+        if not name.startswith("curriculum_shadow_")
+        and name
+        not in {
+            "curriculum_smoothed_probabilities",
+            "curriculum_last_probability_smoothing_iteration",
+        }
+    }
+    schema3_state["curriculum_state_schema_version"] = torch.tensor(3)
+    restored = _v15_command()
+
+    assert restored.load_adaptive_sampling_state(schema3_state)
+
+    # Fixed-H sufficient statistics are valid and expensive to recollect, but
+    # schema3 states/history were contaminated by terminal-only fallback.
+    for name in (
+        "curriculum_start_trials",
+        "curriculum_start_failures",
+        "curriculum_start_censored",
+        "curriculum_start_survival_steps",
+        "curriculum_start_completion_fraction",
+        "curriculum_terminal_visits",
+        "curriculum_terminal_failures",
+        "curriculum_terminal_body_failures",
+    ):
+        torch.testing.assert_close(getattr(restored, name), getattr(source, name))
+    assert torch.all(restored._curriculum_states == restored._CURRICULUM_UNKNOWN)
+    assert torch.isnan(restored._curriculum_failure_rate_history).all()
+    assert restored._curriculum_window_start_trials.count_nonzero().item() == 0
+    assert restored._curriculum_window_start_failures.count_nonzero().item() == 0
+    assert restored._curriculum_iteration == 0
+    assert restored._curriculum_blend_start_iteration == -1
+    # Despite resetting the classifier, migration shadow reconstructs the
+    # sampler that was actually active at the schema3 checkpoint.
+    torch.testing.assert_close(restored.adp_sampling_prob, source_distribution)
 
 
 def test_v15_horizon_change_preserves_only_terminal_evidence() -> None:

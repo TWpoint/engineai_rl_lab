@@ -29,6 +29,11 @@ class T800FlatWoStateEstimationEnvCfgV15Scale(T800FlatWoStateEstimationEnvCfgV14
         motion.curriculum_min_terminal_visits = 32
         motion.curriculum_quarantine_terminal_hazard_threshold = 0.10
         motion.curriculum_terminal_hazard_window_bins = 2
+        # Missing state budgets become uniform replay rather than being
+        # renormalized into the remaining hard states. Smooth state-refresh
+        # changes over several PPO iterations to avoid 50-iteration cliffs.
+        motion.curriculum_preserve_absent_state_budgets = True
+        motion.curriculum_probability_smoothing_alpha = 0.2
         # Keep body-level counts in checkpoints for offline audits without
         # filling W&B with one curve per body and every redundant state mass.
         motion.curriculum_detailed_metrics = False
