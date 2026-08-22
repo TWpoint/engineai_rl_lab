@@ -12,7 +12,7 @@ v17_master_port="${3:-29507}"
 v17_project_dir="/mnt/workspace/lpz/engineai/engineai_rl_lab"
 v17_python="/mnt/workspace/lpz/engineai/engineai/bin/python"
 v17_load_run="2026-08-21_22-41-15_v16-scale"
-v17_checkpoint="model_11750.pt"
+v17_checkpoint="model_12250.pt"
 v17_checkpoint_path="${v17_project_dir}/logs/rsl_rl/tracking_t800/${v17_load_run}/${v17_checkpoint}"
 
 case "$v17_node_rank" in
@@ -25,7 +25,7 @@ case "$v17_node_rank" in
         ;;
 esac
 
-v17_log="${v17_project_dir}/v17_scale_resume_11750_3node_12000_${v17_node_name}.log"
+v17_log="${v17_project_dir}/v17_scale_resume_12250_3node_12000_${v17_node_name}.log"
 
 cd "$v17_project_dir"
 exec > >(tee "$v17_log") 2>&1
