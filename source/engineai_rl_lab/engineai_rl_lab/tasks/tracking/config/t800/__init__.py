@@ -387,6 +387,26 @@ gym.register(
 )
 
 gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v16-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v16:T800FlatWoStateEstimationEnvCfgV16Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v16:T800FlatV16ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v17-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v17:T800FlatWoStateEstimationEnvCfgV17Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v17:T800FlatV17ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Tracking-Flat-T800-Low-Freq-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

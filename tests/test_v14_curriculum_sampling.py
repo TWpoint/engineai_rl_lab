@@ -49,6 +49,16 @@ def _curriculum_command() -> SimpleNamespace:
         curriculum_improvement_threshold=0.05,
         curriculum_start_horizon_frames=None,
         curriculum_exclude_invalid_failures=False,
+        curriculum_start_eligibility_enabled=False,
+        curriculum_terminal_replay_fraction=0.0,
+        curriculum_coverage_aware_enabled=False,
+        curriculum_provisional_known_trials=8,
+        curriculum_min_provisional_known_fraction=0.0,
+        curriculum_min_provisional_motion_fraction=0.0,
+        curriculum_provisional_motion_bin_fraction=0.0,
+        curriculum_unconfirmed_min_coverage_ratio=0.0,
+        curriculum_state_focus_start_fraction=0.0,
+        curriculum_state_focus_end_fraction=1.0,
         curriculum_motion_length_exponent=1.0,
         curriculum_min_terminal_visits=0,
         curriculum_quarantine_terminal_hazard_threshold=0.0,
@@ -65,6 +75,7 @@ def _curriculum_command() -> SimpleNamespace:
         },
     )
     command.global_num_motions = 1
+    command._global_time_totals = torch.tensor([20], dtype=torch.long)
     command.bin_count = 5
     command.motion_bin_counts = torch.tensor([5], dtype=torch.long)
     command.motion_bin_offsets = torch.tensor([0], dtype=torch.long)
@@ -119,12 +130,18 @@ def _curriculum_command() -> SimpleNamespace:
         "_CURRICULUM_STATE_SCHEMA_VERSION",
         "_CURRICULUM_BIASED_FIXED_HORIZON_SCHEMA_VERSION",
         "_CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION",
+        "_CURRICULUM_ELIGIBLE_COVERAGE_SCHEMA_VERSION",
+        "_CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION",
     ):
         setattr(command, constant_name, getattr(MotionCommand, constant_name))
     for method_name in (
         "_curriculum_sampling_enabled",
         "_curriculum_fixed_horizon_enabled",
+        "_curriculum_start_eligibility_enabled",
+        "_curriculum_coverage_aware_enabled",
+        "_curriculum_quality_learning_enabled",
         "_curriculum_checkpoint_schema_version",
+        "_initialize_curriculum_start_geometry",
         "_initialize_curriculum_sampling",
         "_bucket_ids",
         "_compute_failure_rate",
@@ -135,7 +152,13 @@ def _curriculum_command() -> SimpleNamespace:
         "_apply_probability_caps",
         "_curriculum_blend_factor",
         "_curriculum_state_budget_probabilities",
+        "_curriculum_provisional_known_mask",
+        "_curriculum_mask_fraction",
+        "_curriculum_provisional_motion_fraction_value",
+        "_curriculum_state_focus_factor",
+        "_curriculum_target_distribution_components",
         "_curriculum_shadow_distribution",
+        "_blend_curriculum_distribution_components",
         "_blend_curriculum_distribution",
         "_smooth_curriculum_distribution",
         "_update_curriculum_metrics",
@@ -151,6 +174,10 @@ def _curriculum_command() -> SimpleNamespace:
         "_record_curriculum_start_censored",
         "_update_adaptive_exposure",
         "_reset_curriculum_sampling_state",
+        "_curriculum_quality_checkpoint_targets",
+        "_curriculum_quality_checkpoint_state_valid",
+        "_restore_curriculum_quality_checkpoint_state",
+        "_finish_curriculum_quality_checkpoint_restore",
         "get_adaptive_sampling_state",
         "_checkpoint_curriculum_distribution",
         "load_adaptive_sampling_state",
