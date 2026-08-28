@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
+import importlib
 import importlib.metadata as metadata
+import importlib.util
 import json
 import os
 import pathlib
@@ -24,6 +27,36 @@ from isaaclab_tasks.utils import setup_preset_cli
 import cli_args as cli_args  # isort: skip
 
 
+class _PositionTargetCompatibilityAdapter:
+    """Expose the removed collection API through the articulation public API."""
+
+    def __init__(self, robot):
+        self._robot = robot
+
+    def set_position_index(self, *, value, env_ids) -> None:
+        self._robot.set_joint_position_target_index(target=value, env_ids=env_ids)
+
+
+class _ActuatorGroupsCompatibilityDict(dict):
+    """Preserve actuator-group dict behavior while serving legacy target writes."""
+
+    def __init__(self, groups, robot):
+        super().__init__(groups)
+        self.target_command = _PositionTargetCompatibilityAdapter(robot)
+
+
+def _install_actuator_target_compatibility(env) -> bool:
+    """Install an evaluation-local bridge before the wrapper's first reset."""
+    robot = env.unwrapped.scene["robot"]
+    groups = robot.actuators
+    if hasattr(groups, "target_command"):
+        return False
+    if not isinstance(groups, dict):
+        raise TypeError(f"unsupported actuator collection type: {type(groups)!r}")
+    robot.actuators = _ActuatorGroupsCompatibilityDict(groups, robot)
+    return True
+
+
 parser = argparse.ArgumentParser(description="Frame-zero per-motion macro checkpoint evaluation.")
 parser.add_argument("--task", type=str, required=True, help="Registered tracking task name.")
 parser.add_argument("--checkpoints", type=str, nargs="+", required=True, help="Checkpoint paths to compare.")
@@ -31,6 +64,11 @@ parser.add_argument("--motion_file", type=str, required=True, help="Source motio
 parser.add_argument("--num_motions", type=int, default=8192, help="Number of unique motions to evaluate.")
 parser.add_argument("--num_envs", type=int, default=4096, help="Parallel evaluation environments.")
 parser.add_argument("--trials_per_motion", type=int, default=3, help="Equal frame-zero trials per motion.")
+parser.add_argument(
+    "--parallel_trials",
+    action="store_true",
+    help="Run the equal trials for each motion in separate environments in the same batch.",
+)
 parser.add_argument("--eval_seed", type=int, default=20260818, help="Evaluation seed.")
 parser.add_argument("--output", type=str, required=True, help="Human-readable output log path.")
 parser.add_argument(
@@ -45,6 +83,40 @@ parser.add_argument(
     default=None,
     help="Optional trusted agent.pkl used to restore the checkpoint's model architecture.",
 )
+parser.add_argument(
+    "--invalid_state_snapshot_dir",
+    type=str,
+    default=None,
+    help="Opt-in directory for atomic invalid-state and finite-runaway diagnostic snapshots.",
+)
+parser.add_argument(
+    "--snapshot_first_control_step",
+    action="store_true",
+    help="Also save one deterministic first-control-step actuator/state snapshot per checkpoint.",
+)
+parser.add_argument(
+    "--newton_num_substeps",
+    type=int,
+    default=None,
+    help="Diagnostic override for Newton solver substeps.",
+)
+parser.add_argument(
+    "--newton_contact_margin",
+    type=float,
+    default=None,
+    help="Diagnostic override for Newton's default shape margin.",
+)
+parser.add_argument(
+    "--eval_action_clip",
+    type=float,
+    default=None,
+    help="Diagnostic override for the evaluation action clip.",
+)
+parser.add_argument(
+    "--disable_reset_randomization",
+    action="store_true",
+    help="Disable startup/reset/interval randomization for a diagnostic replay only.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = setup_preset_cli(parser, agent_library="rsl_rl")
@@ -55,6 +127,7 @@ import numpy as np
 import torch
 import yaml
 from engineai_rl_lab.tasks.tracking.mdp.motion_data import resolve_motion_files
+from engineai_rl_lab.tasks.tracking.mdp.recorders import InvalidRobotStateRecorderManagerCfg
 from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab.app import launch_simulation
@@ -96,6 +169,35 @@ class _EnvSnapshotUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
+def _backfill_motion_defaults(motion_cfg) -> list[str]:
+    """Restore no-op command defaults added after a trusted snapshot was saved.
+
+    Pickle restores an instance's stored ``__dict__`` without adding fields
+    introduced later on its config class.  Keep every saved value intact and
+    fill only absent MotionCommandV1Cfg and AdaptiveSamplerV1Cfg fields from
+    fresh current default instances.  The v22 snapshots predate optional
+    catalog/sharding and multi-error difficulty fields; their defaults disable
+    those features and therefore preserve the snapshot's original behavior.
+    """
+
+    added = []
+    motion_defaults = type(motion_cfg)()
+    for name, value in vars(motion_defaults).items():
+        if name == "adaptive_sampling":
+            continue
+        if not hasattr(motion_cfg, name):
+            setattr(motion_cfg, name, copy.deepcopy(value))
+            added.append(f"motion.{name}")
+
+    sampler_cfg = motion_cfg.adaptive_sampling
+    sampler_defaults = type(sampler_cfg)()
+    for name, value in vars(sampler_defaults).items():
+        if not hasattr(sampler_cfg, name):
+            setattr(sampler_cfg, name, copy.deepcopy(value))
+            added.append(f"adaptive_sampling.{name}")
+    return added
+
+
 def _sanitize_rsl_rl_cfg(cfg: dict) -> dict:
     legacy_model_keys = {"stochastic", "init_noise_std", "noise_std_type", "state_dependent_std"}
     for model_name in ("actor", "critic"):
@@ -103,6 +205,13 @@ def _sanitize_rsl_rl_cfg(cfg: dict) -> dict:
         if isinstance(model_cfg, dict):
             for key in legacy_model_keys:
                 model_cfg.pop(key, None)
+    algorithm_cfg = cfg.get("algorithm")
+    if isinstance(algorithm_cfg, dict) and "sonic_kl_adaptation" in algorithm_cfg:
+        # The v22 snapshot predates the local rsl_rl rename performed after
+        # training launched.  Preserve the saved boolean under its current
+        # equivalent name so OnPolicyRunner can construct PPO for inference.
+        algorithm_cfg.setdefault("shared_kl_adaptation", algorithm_cfg["sonic_kl_adaptation"])
+        algorithm_cfg.pop("sonic_kl_adaptation")
     return cfg
 
 
@@ -112,6 +221,57 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _apply_concrete_newton_overrides(physics_cfg, *, num_substeps: int | None, contact_margin: float | None) -> None:
+    """Apply replay overrides to Hydra's already-selected concrete physics config."""
+    physics_type = f"{type(physics_cfg).__module__}.{type(physics_cfg).__qualname__}"
+    if num_substeps is not None:
+        if num_substeps <= 0:
+            raise ValueError("--newton_num_substeps must be positive")
+        if not hasattr(physics_cfg, "num_substeps"):
+            raise ValueError(
+                "--newton_num_substeps requires physics=newton_mjwarp; "
+                f"resolved physics config {physics_type!r} has no num_substeps"
+            )
+        physics_cfg.num_substeps = num_substeps
+    if contact_margin is not None:
+        if contact_margin < 0.0:
+            raise ValueError("--newton_contact_margin must be non-negative")
+        shape_cfg = getattr(physics_cfg, "default_shape_cfg", None)
+        if shape_cfg is None or not hasattr(shape_cfg, "margin"):
+            raise ValueError(
+                "--newton_contact_margin requires physics=newton_mjwarp; "
+                f"resolved physics config {physics_type!r} has no default_shape_cfg.margin"
+            )
+        shape_cfg.margin = contact_margin
+
+
+def _apply_diagnostic_overrides(env_cfg, agent_cfg) -> None:
+    """Apply opt-in replay controls without changing the saved training MDP."""
+    _apply_concrete_newton_overrides(
+        env_cfg.sim.physics,
+        num_substeps=args_cli.newton_num_substeps,
+        contact_margin=args_cli.newton_contact_margin,
+    )
+    if args_cli.eval_action_clip is not None:
+        if args_cli.eval_action_clip <= 0.0:
+            raise ValueError("--eval_action_clip must be positive")
+        agent_cfg.clip_actions = args_cli.eval_action_clip
+    if args_cli.disable_reset_randomization:
+        env_cfg.commands.motion.pose_range = {}
+        env_cfg.commands.motion.velocity_range = {}
+        env_cfg.commands.motion.joint_position_range = (0.0, 0.0)
+        for event_name in ("physics_material", "add_joint_default_pos", "base_com", "push_robot"):
+            if hasattr(env_cfg.events, event_name):
+                setattr(env_cfg.events, event_name, None)
+    if args_cli.snapshot_first_control_step and args_cli.invalid_state_snapshot_dir is None:
+        raise ValueError("--snapshot_first_control_step requires --invalid_state_snapshot_dir")
+    if args_cli.invalid_state_snapshot_dir is not None:
+        recorder_cfg = InvalidRobotStateRecorderManagerCfg()
+        recorder_cfg.invalid_robot_state.snapshot_dir = args_cli.invalid_state_snapshot_dir
+        recorder_cfg.invalid_robot_state.capture_first_control_step = args_cli.snapshot_first_control_step
+        env_cfg.recorders = recorder_cfg
 
 
 def _quantiles(values: np.ndarray) -> dict[str, float]:
@@ -128,8 +288,77 @@ def _source_name(path: str) -> str:
     return "other"
 
 
-def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_motion: int, seed: int) -> dict:
+def _load_deleted_v24_multi_critic_compat() -> None:
+    """Load the exact locally-versioned v24 classes if their source was removed mid-evaluation."""
+    module_names = (
+        "engineai_rl_lab.tasks.tracking.multi_critic_env",
+        "engineai_rl_lab.utils.multi_critic_ppo",
+    )
+    try:
+        importlib.import_module(module_names[-1])
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name not in module_names:
+            raise
+
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+
+    # The same workspace cleanup that removed the v24 algorithm also reverted
+    # RolloutStorage's multi-value-head allocation.  Load that exact historical
+    # class only into this evaluation process before importing MultiCriticPPO.
+    storage_archive = (
+        repo_root.parent
+        / "rsl_rl"
+        / ".stversions"
+        / "rsl_rl"
+        / "storage"
+        / "rollout_storage~20260826-185932.py"
+    )
+    if not storage_archive.is_file():
+        raise ModuleNotFoundError(f"Missing v24 RolloutStorage compatibility source: {storage_archive}")
+    storage_spec = importlib.util.spec_from_file_location("_frame0_v24_rollout_storage", storage_archive)
+    if storage_spec is None or storage_spec.loader is None:
+        raise ImportError(f"Cannot load v24 RolloutStorage from {storage_archive}")
+    storage_module = importlib.util.module_from_spec(storage_spec)
+    storage_spec.loader.exec_module(storage_module)
+    import rsl_rl.storage as storage_package
+
+    storage_package.RolloutStorage = storage_module.RolloutStorage
+    print(f"[FRAME0] Loaded v24 multi-head RolloutStorage from local history: {storage_archive}")
+
+    archive_root = repo_root / ".stversions" / "source" / "engineai_rl_lab" / "engineai_rl_lab"
+    patterns = (
+        archive_root / "tasks" / "tracking" / "multi_critic_env~*.py",
+        archive_root / "utils" / "multi_critic_ppo~*.py",
+    )
+    for module_name, pattern in zip(module_names, patterns, strict=True):
+        candidates = sorted(pattern.parent.glob(pattern.name))
+        if not candidates:
+            raise ModuleNotFoundError(
+                f"Missing {module_name} and no local version-history copy exists at {pattern}"
+            )
+        source = candidates[-1]
+        spec = importlib.util.spec_from_file_location(module_name, source)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load compatibility module {module_name} from {source}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        print(f"[FRAME0] Loaded missing v24 compatibility module from local history: {source}")
+
+
+def _evaluate_checkpoint(
+    env,
+    agent_cfg,
+    checkpoint: pathlib.Path,
+    trials_per_motion: int,
+    seed: int,
+    parallel_trials: bool = False,
+) -> dict:
     unwrapped = env.unwrapped
+    # Recorder filenames and per-context first-step budgets remain unambiguous
+    # when several checkpoints share one evaluator/environment process.
+    unwrapped.invalid_state_snapshot_context = checkpoint.stem
     command = unwrapped.command_manager.get_term("motion")
     termination_manager = unwrapped.termination_manager
     device = unwrapped.device
@@ -142,9 +371,14 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
     if not success_termination_names:
         raise RuntimeError(f"No success timeout termination found in active terms: {termination_names}")
 
+    sanitized_agent_cfg = _sanitize_rsl_rl_cfg(agent_cfg.to_dict())
+    algorithm_class = str(sanitized_agent_cfg.get("algorithm", {}).get("class_name", ""))
+    if algorithm_class == "engineai_rl_lab.utils.multi_critic_ppo:MultiCriticPPO":
+        _load_deleted_v24_multi_critic_compat()
+
     runner = OnPolicyRunner(
         env,
-        _sanitize_rsl_rl_cfg(agent_cfg.to_dict()),
+        sanitized_agent_cfg,
         log_dir=None,
         device=device,
     )
@@ -159,21 +393,45 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
     episode_length_sums = torch.zeros(num_motions, dtype=torch.float64, device=device)
     step_counts = torch.zeros(num_motions, dtype=torch.long, device=device)
     step_reward_sums = torch.zeros(num_motions, dtype=torch.float64, device=device)
-    error_sums = {name: torch.zeros(num_motions, dtype=torch.float64, device=device) for name in error_names}
+    # Accumulate every tracking metric in one 2-D tensor.  The previous loop
+    # launched one index_add kernel per metric and per simulation step, which
+    # is especially expensive for the low-environment, long-motion shards.
+    error_sums = torch.zeros((num_motions, len(error_names)), dtype=torch.float64, device=device)
     body_pos_failure_details = []
 
-    batch_count = (num_motions + num_envs - 1) // num_envs
-    for batch_index, batch_start in enumerate(range(0, num_motions, num_envs)):
-        batch_end = min(batch_start + num_envs, num_motions)
-        batch_size = batch_end - batch_start
+    envs_per_motion = trials_per_motion if parallel_trials else 1
+    motions_per_batch = num_envs // envs_per_motion
+    if motions_per_batch <= 0:
+        raise ValueError(
+            f"num_envs={num_envs} is too small for {envs_per_motion} parallel trial environments per motion"
+        )
+    batch_count = (num_motions + motions_per_batch - 1) // motions_per_batch
+    for batch_index, batch_start in enumerate(range(0, num_motions, motions_per_batch)):
+        batch_end = min(batch_start + motions_per_batch, num_motions)
+        batch_motion_count = batch_end - batch_start
+        batch_size = batch_motion_count * envs_per_motion
         assigned_motion_ids = torch.full((num_envs,), batch_start, dtype=torch.long, device=device)
-        assigned_motion_ids[:batch_size] = torch.arange(batch_start, batch_end, device=device)
+        assigned_motion_ids[:batch_size] = torch.arange(
+            batch_start, batch_end, device=device
+        ).repeat_interleave(envs_per_motion)
         command.set_fixed_motion_ids(assigned_motion_ids)
 
         _seed_everything(seed + batch_index)
         obs = env.reset()
         if isinstance(obs, tuple):
             obs = obs[0]
+        # ManagerBasedEnv.reset() forwards the articulation but does not run a
+        # command-manager update.  Synchronize robot-aligned reference caches
+        # before the first physics step, since v23 rewards/terminations consume
+        # them before CommandManager.compute() runs at the end of that step.
+        refresh_relative_targets = getattr(command, "refresh_relative_body_targets", None)
+        if refresh_relative_targets is not None:
+            refresh_relative_targets()
+        elif "end_effector_height" in termination_names:
+            raise RuntimeError(
+                "The active end_effector_height termination requires a command implementation "
+                "that can refresh frame-zero relative body targets after reset"
+            )
         if hasattr(policy, "reset"):
             policy.reset(torch.ones(num_envs, dtype=torch.bool, device=device))
 
@@ -188,10 +446,12 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
         if "time_out" in success_termination_names:
             per_trial_step_limits.append(int(unwrapped.max_episode_length))
         max_trial_steps = min(per_trial_step_limits) + 2
-        max_batch_steps = trials_per_motion * max_trial_steps + 2
+        required_trials_per_env = 1 if parallel_trials else trials_per_motion
+        max_batch_steps = required_trials_per_env * max_trial_steps + 2
         print(
             f"[FRAME0] {checkpoint.name} batch {batch_index + 1}/{batch_count} starting: "
-            f"motions={batch_size}, max_trial_steps={max_trial_steps}, max_batch_steps={max_batch_steps}"
+            f"motions={batch_motion_count}, active_envs={batch_size}, "
+            f"max_trial_steps={max_trial_steps}, max_batch_steps={max_batch_steps}"
         )
 
         with torch.inference_mode():
@@ -213,12 +473,11 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
                 step_reward_sums.index_add_(0, active_motion_ids, rewards[active_env_ids])
                 episode_returns[active_env_ids] += rewards[active_env_ids]
                 episode_lengths[active_env_ids] += 1
-                for name in error_names:
-                    error_sums[name].index_add_(
-                        0,
-                        active_motion_ids,
-                        command.metrics[name][active_env_ids].double(),
-                    )
+                step_errors = torch.stack(
+                    [command.metrics[name][active_env_ids] for name in error_names],
+                    dim=1,
+                ).double()
+                error_sums.index_add_(0, active_motion_ids, step_errors)
 
                 done_env_ids = torch.where(dones & active_before_step)[0]
                 if done_env_ids.numel() == 0:
@@ -262,7 +521,9 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
                 trial_counts[done_env_ids] += 1
                 episode_returns[done_env_ids] = 0.0
                 episode_lengths[done_env_ids] = 0
-                finished_env_ids = done_env_ids[trial_counts[done_env_ids] >= trials_per_motion]
+                finished_env_ids = done_env_ids[
+                    trial_counts[done_env_ids] >= required_trials_per_env
+                ]
                 active[finished_env_ids] = False
             else:
                 raise RuntimeError(
@@ -273,7 +534,7 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
 
         print(
             f"[FRAME0] {checkpoint.name} batch {batch_index + 1}/{batch_count}: "
-            f"motions={batch_size}, steps={batch_step + 1}"
+            f"motions={batch_motion_count}, steps={batch_step + 1}"
         )
 
     command.clear_fixed_motion_ids()
@@ -287,7 +548,10 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
     successes_cpu = successes.cpu().numpy()
     rates = successes_cpu / attempts_cpu
     step_counts_cpu = step_counts.cpu().numpy()
-    per_motion_errors = {name: error_sums[name].cpu().numpy() / step_counts_cpu for name in error_names}
+    error_sums_cpu = error_sums.cpu().numpy()
+    per_motion_errors = {
+        name: error_sums_cpu[:, index] / step_counts_cpu for index, name in enumerate(error_names)
+    }
     paths = [command._motion_files[int(global_id)] for global_id in command.motion.global_ids.cpu().tolist()]
     lengths = command.motion.lengths(torch.arange(num_motions, device=device)).cpu().numpy()
     failed_attempts_cpu = failed_attempts.cpu().numpy()
@@ -331,10 +595,10 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, trials_per_mo
         }
 
     error_summary = {}
-    for name, values in per_motion_errors.items():
+    for index, (name, values) in enumerate(per_motion_errors.items()):
         error_summary[name] = {
             "macro_mean": float(values.mean()),
-            "transition_weighted_mean": float(error_sums[name].sum().item() / step_counts.sum().item()),
+            "transition_weighted_mean": float(error_sums[:, index].sum().item() / step_counts.sum().item()),
             **_quantiles(values),
         }
 
@@ -453,6 +717,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         for group_cfg in vars(env_cfg.observations).values():
             if hasattr(group_cfg, "enable_corruption"):
                 group_cfg.enable_corruption = False
+        added_motion_fields = _backfill_motion_defaults(env_cfg.commands.motion)
+        if added_motion_fields:
+            print(
+                "[FRAME0] Backfilled post-snapshot motion defaults: "
+                + ", ".join(added_motion_fields)
+            )
         env_cfg_snapshot = str(snapshot_path)
         print(f"[FRAME0] Restored environment config from {snapshot_path}")
     if args_cli.agent_cfg_snapshot is not None:
@@ -465,7 +735,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg_snapshot = str(snapshot_path)
         print(f"[FRAME0] Restored agent config from {snapshot_path}")
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs = args_cli.num_envs
+    _apply_diagnostic_overrides(env_cfg, agent_cfg)
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else "cuda:0"
     env_cfg.seed = args_cli.eval_seed
     agent_cfg.device = env_cfg.sim.device
@@ -484,13 +754,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         selected_motion_files = source_motion_files
         evaluation_manifest = pathlib.Path(source_motion_file)
-    if len(selected_motion_files) > args_cli.num_envs and len(selected_motion_files) % args_cli.num_envs != 0:
+    effective_num_envs = args_cli.num_envs
+    if not args_cli.parallel_trials:
+        # Sequential trials need at most one environment per motion.
+        effective_num_envs = min(effective_num_envs, len(selected_motion_files))
+    env_cfg.scene.num_envs = effective_num_envs
+    if len(selected_motion_files) > effective_num_envs and len(selected_motion_files) % effective_num_envs != 0:
         print("[WARN] Final motion batch will contain inactive padding environments.")
 
     env_cfg.commands.motion.motion_file = str(evaluation_manifest)
     env_cfg.commands.motion.uniform_sampling_rate = 1.0
     env_cfg.commands.motion.pre_failure_sample_window = 0
     env_cfg.commands.motion.max_num_load_motions = len(selected_motion_files)
+    # Trusted snapshots created before fixed-joint support do not carry this
+    # newly-added config field.  An empty mapping exactly preserves the old
+    # command behavior while allowing the current command implementation to
+    # consume the historical snapshot.
+    if not hasattr(env_cfg.commands.motion, "fixed_joint_positions"):
+        env_cfg.commands.motion.fixed_joint_positions = {}
+    # Older trusted config snapshots predate the explicit playback override.
+    # Preserve their original behavior before forcing frame-zero starts below.
+    if not hasattr(env_cfg.commands.motion, "playback_start_frame"):
+        env_cfg.commands.motion.playback_start_frame = None
     env_cfg.commands.motion.start_at_motion_beginning = True
     env_cfg.commands.motion.debug_vis = False
     for model_name in ("actor", "critic"):
@@ -509,6 +794,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.make(args_cli.task, cfg=env_cfg)
         if isinstance(env.unwrapped, DirectMARLEnv):
             env = multi_agent_to_single_agent(env)
+        if _install_actuator_target_compatibility(env):
+            print("[FRAME0] Installed evaluation-local actuator target compatibility bridge.")
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         command = env.unwrapped.command_manager.get_term("motion")
         if command.motion.num_motions != len(selected_motion_files):
@@ -518,7 +805,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         for checkpoint in checkpoints:
             print(f"[FRAME0] Evaluating {checkpoint.name}...")
             results.append(
-                _evaluate_checkpoint(env, agent_cfg, checkpoint, args_cli.trials_per_motion, args_cli.eval_seed)
+                _evaluate_checkpoint(
+                    env,
+                    agent_cfg,
+                    checkpoint,
+                    args_cli.trials_per_motion,
+                    args_cli.eval_seed,
+                    args_cli.parallel_trials,
+                )
             )
 
         report = [
@@ -531,8 +825,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"Evaluation manifest: {evaluation_manifest}",
             f"Seed: {args_cli.eval_seed}",
             f"Motions: {len(selected_motion_files)}",
-            f"Environments: {args_cli.num_envs}",
+            f"Environments: {effective_num_envs}",
             f"Equal trials per motion: {args_cli.trials_per_motion}",
+            f"Trial execution: {'parallel environments' if args_cli.parallel_trials else 'sequential per environment'}",
+            "Frame-zero reset synchronization: relative body targets refreshed before first physics step (v1)",
             "Episode start: frame zero",
             "Success: reaches motion end or task horizon without any active failure termination",
             "Reset/event randomization: task defaults retained",
@@ -555,8 +851,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "evaluation_manifest": str(evaluation_manifest),
                     "seed": args_cli.eval_seed,
                     "num_motions": len(selected_motion_files),
-                    "num_envs": args_cli.num_envs,
+                    "num_envs": effective_num_envs,
                     "trials_per_motion": args_cli.trials_per_motion,
+                    "parallel_trials": args_cli.parallel_trials,
+                    "frame_zero_reset_sync_version": 1,
                     "results": results,
                 },
                 indent=2,

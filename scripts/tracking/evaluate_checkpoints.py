@@ -36,6 +36,12 @@ parser.add_argument(
     help="Reset every episode to frame zero instead of sampling a random motion time.",
 )
 parser.add_argument("--output", type=str, required=True, help="Path for the human-readable evaluation log.")
+parser.add_argument(
+    "--invalid_state_snapshot_dir",
+    type=str,
+    default=None,
+    help="Opt-in directory for invalid_robot_state and finite-runaway diagnostic snapshots.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = setup_preset_cli(parser, agent_library="rsl_rl")
@@ -46,6 +52,7 @@ import numpy as np
 import torch
 import yaml
 from engineai_rl_lab.tasks.tracking.mdp.motion_data import resolve_motion_files
+from engineai_rl_lab.tasks.tracking.mdp.recorders import InvalidRobotStateRecorderManagerCfg
 from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab.app import launch_simulation
@@ -86,6 +93,7 @@ def _safe_mean(values: list[float]) -> float:
 
 def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, eval_steps: int, seed: int) -> dict:
     _seed_everything(seed)
+    env.unwrapped.invalid_state_snapshot_context = checkpoint.stem
     obs = env.reset()
     if isinstance(obs, tuple):
         obs = obs[0]
@@ -96,7 +104,11 @@ def _evaluate_checkpoint(env, agent_cfg, checkpoint: pathlib.Path, eval_steps: i
         log_dir=None,
         device=env.unwrapped.device,
     )
-    runner.load(str(checkpoint))
+    # Evaluation only consumes the actor.  Loading the whole algorithm makes
+    # historical multi-critic checkpoints depend on their deleted critic/PPO
+    # implementation even though none of it participates in inference.
+    checkpoint_data = torch.load(checkpoint, weights_only=False, map_location=env.unwrapped.device)
+    runner.alg.get_policy().load_state_dict(checkpoint_data["actor_state_dict"], strict=True)
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
     unwrapped = env.unwrapped
@@ -255,6 +267,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.commands.motion.max_num_load_motions = args_cli.working_set_size
     env_cfg.commands.motion.start_at_motion_beginning = args_cli.start_at_motion_beginning
     env_cfg.commands.motion.debug_vis = False
+    if args_cli.invalid_state_snapshot_dir is not None:
+        recorder_cfg = InvalidRobotStateRecorderManagerCfg()
+        recorder_cfg.invalid_robot_state.snapshot_dir = os.path.abspath(args_cli.invalid_state_snapshot_dir)
+        env_cfg.recorders = recorder_cfg
     installed_rsl_rl_version = metadata.version("rsl-rl-lib")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_rsl_rl_version)
     checkpoints = [pathlib.Path(path).resolve() for path in args_cli.checkpoints]

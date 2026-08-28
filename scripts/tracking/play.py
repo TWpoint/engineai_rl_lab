@@ -8,6 +8,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 # Register the downstream tasks before preset-aware argument parsing so --help can enumerate their variants.
 import engineai_rl_lab.tasks  # noqa: F401, E402
@@ -55,6 +56,13 @@ parser.add_argument(
     help="Start every playback episode at frame zero instead of sampling a random motion time.",
 )
 parser.add_argument(
+    "--start_frame",
+    "--start-frame",
+    type=int,
+    default=None,
+    help="Start every playback episode at this zero-based reference-motion frame.",
+)
+parser.add_argument(
     "--ghost_reference",
     action="store_true",
     default=False,
@@ -72,6 +80,15 @@ parser.add_argument(
     default=1.0,
     help="Lateral distance in meters between the policy and reference robots (default: 1.0).",
 )
+parser.add_argument(
+    "--disable_body_pos_termination",
+    "--disable-body-pos-termination",
+    "--disable_termination",
+    "--disable-termination",
+    action="store_true",
+    default=False,
+    help="Disable pose/position tracking-error terminations during playback.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append simulation launcher and backend-preset arguments
@@ -86,12 +103,6 @@ sys.argv = [sys.argv[0]] + hydra_args
 
 import gymnasium as gym
 import torch
-from engineai_rl_lab.utils.exporter import (
-    attach_onnx_metadata,
-    export_motion_policy_as_onnx,
-    get_actor_obs_normalizer,
-)
-from rsl_rl.runners import OnPolicyRunner
 
 import isaaclab.sim as sim_utils
 from isaaclab.app import launch_simulation
@@ -105,7 +116,7 @@ from isaaclab.envs import (
 from isaaclab.utils.math import quat_apply, yaw_quat
 
 from isaaclab_rl.entrypoints.common import apply_video_recording, pre_launch_video_config
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, handle_deprecated_rsl_rl_cfg
 
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -152,9 +163,37 @@ def main(  # noqa: C901
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     env_cfg.sim.use_fabric = not args_cli.disable_fabric
-    if args_cli.start_at_motion_beginning:
+    if args_cli.start_frame is not None:
+        if args_cli.start_frame < 0:
+            raise ValueError("--start_frame must be non-negative.")
+        if args_cli.start_at_motion_beginning:
+            raise ValueError("--start_frame cannot be combined with --start_at_motion_beginning.")
+        env_cfg.commands.motion.playback_start_frame = args_cli.start_frame
+        print(f"[INFO]: Starting every playback episode at motion frame {args_cli.start_frame}.")
+    elif args_cli.start_at_motion_beginning:
         env_cfg.commands.motion.start_at_motion_beginning = True
         print("[INFO]: Starting every playback episode at the beginning of the motion.")
+    if args_cli.disable_body_pos_termination:
+        tracking_termination_names = (
+            "body_pos",
+            "anchor_pos",
+            "anchor_ori",
+            "ee_body_pos",
+            "anchor_height",
+            "anchor_orientation",
+            "end_effector_height",
+        )
+        disabled_terminations = []
+        for name in tracking_termination_names:
+            if hasattr(env_cfg.terminations, name) and getattr(env_cfg.terminations, name) is not None:
+                setattr(env_cfg.terminations, name, None)
+                disabled_terminations.append(name)
+        if not disabled_terminations:
+            raise ValueError("This task does not define any pose/position tracking termination terms.")
+        print(
+            "[INFO]: Disabled tracking terminations for playback: "
+            + ", ".join(disabled_terminations)
+        )
     if args_cli.ghost_reference:
         if not 0.0 < args_cli.ghost_opacity <= 1.0:
             raise ValueError("--ghost_opacity must be in the interval (0, 1].")
@@ -228,6 +267,17 @@ def main(  # noqa: C901
 
     pre_launch_video_config(env_cfg, args_cli=args_cli)
     with launch_simulation(env_cfg, args_cli):
+        # These modules load protobuf/gRPC. Import them only after Kit has started;
+        # importing them earlier conflicts with omni.grpc during PhysX startup.
+        from engineai_rl_lab.utils.exporter import (
+            attach_onnx_metadata,
+            export_motion_policy_as_onnx,
+            get_actor_obs_normalizer,
+            rewrite_silu_for_mnn_2_9_5,
+        )
+        from rsl_rl.runners import OnPolicyRunner
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+
         env_cfg.log_dir = log_dir
         apply_video_recording(env_cfg, log_dir, args_cli, subdir="play")
         # create isaac environment after the requested physics backend has been launched
@@ -306,21 +356,34 @@ def main(  # noqa: C901
                 print("[WARN] MNN is not installed in the current Python environment. Skipping MNN conversion.")
             else:
                 try:
-                    subprocess.run(
-                        [
-                            sys.executable,
-                            "-m",
-                            "MNN.tools.mnnconvert",
-                            "-f",
-                            "ONNX",
-                            "--modelFile",
-                            onnx_file,
-                            "--MNNModel",
-                            mnn_file,
-                            "--bizCode",
-                            "MNN",
-                        ],
-                        check=True,
+                    # The deployment SDK uses MNN 2.9.5. MNN 3.6.1's
+                    # converter otherwise fuses ONNX x*sigmoid(x) into a SILU
+                    # opcode that the older runtime cannot execute, even with
+                    # --targetVersion alone.
+                    with tempfile.TemporaryDirectory(prefix="engineai_mnn_2_9_5_") as temporary_dir:
+                        compatible_onnx_file = os.path.join(temporary_dir, "policy.onnx")
+                        rewritten_silu_count = rewrite_silu_for_mnn_2_9_5(onnx_file, compatible_onnx_file)
+                        subprocess.run(
+                            [
+                                sys.executable,
+                                "-m",
+                                "MNN.tools.mnnconvert",
+                                "-f",
+                                "ONNX",
+                                "--modelFile",
+                                compatible_onnx_file,
+                                "--MNNModel",
+                                mnn_file,
+                                "--bizCode",
+                                "MNN",
+                                "--targetVersion",
+                                "2.9.5",
+                            ],
+                            check=True,
+                        )
+                    print(
+                        "[INFO]: MNN 2.9.5 compatibility lowering rewrote "
+                        f"{rewritten_silu_count} ONNX SiLU pattern(s)."
                     )
                     print(f"Successfully converted to MNN: {mnn_file}")
                 except subprocess.CalledProcessError as err:
@@ -334,10 +397,9 @@ def main(  # noqa: C901
 
         obs = env.get_observations()
         ghost_robot = None
-        motion_command = None
+        motion_command = env.unwrapped.command_manager.get_term("motion")
         if args_cli.ghost_reference:
             ghost_robot = env.unwrapped.scene["ghost_reference"]
-            motion_command = env.unwrapped.command_manager.get_term("motion")
             if ghost_robot.joint_names != motion_command.robot.joint_names:
                 raise RuntimeError("Reference robot joint ordering does not match the policy robot.")
 
@@ -366,12 +428,43 @@ def main(  # noqa: C901
 
         update_ghost_reference()
         timestep = 0
+        episode_index = 1
+        episode_steps = 0
+        episode_total_steps = max(
+            int((motion_command.motion_lengths[0] - motion_command.time_steps[0] - 1).item()), 1
+        )
         try:
             while env.unwrapped.sim.is_headless_or_exist_active_visualizer():
                 with torch.inference_mode():
                     actions = policy(obs)
                     obs, _, dones, _ = env.step(actions)
+                    episode_steps += 1
                     update_ghost_reference()
+                    if bool(dones[0].item()):
+                        termination_manager = env.unwrapped.termination_manager
+                        reasons = [
+                            name
+                            for name in termination_manager.active_terms
+                            if bool(termination_manager.get_term(name)[0].item())
+                        ]
+                        reason_text = ", ".join(reasons) if reasons else "unknown"
+                        print(
+                            f"[TERMINATION] Episode {episode_index}: {reason_text} "
+                            f"(steps {episode_steps}/{episode_total_steps})",
+                            flush=True,
+                        )
+                        episode_index += 1
+                        episode_steps = 0
+                        episode_total_steps = max(
+                            int(
+                                (
+                                    motion_command.motion_lengths[0]
+                                    - motion_command.time_steps[0]
+                                    - 1
+                                ).item()
+                            ),
+                            1,
+                        )
                     if hasattr(policy, "reset"):
                         policy.reset(dones)
                 if args_cli.follow_camera:

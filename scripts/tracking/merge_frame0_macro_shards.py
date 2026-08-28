@@ -20,6 +20,7 @@ LENGTH_BINS = (
     ("5001_10000", 5000, 10000),
     ("gt10000", 10000, math.inf),
 )
+RESET_SYNC_VERSION = 1
 
 
 def _quantiles(values: np.ndarray) -> dict[str, float]:
@@ -78,6 +79,33 @@ def prepare(reference_json: pathlib.Path, output_dir: pathlib.Path) -> None:
         print(
             f"{shard['label']}: motions={shard['num_motions']}, frames=[{shard['min_frames']}, {shard['max_frames']}]"
         )
+
+
+def prepare_manifest(manifest: pathlib.Path, output_dir: pathlib.Path) -> None:
+    """Build the fixed length shards directly from a motion YAML manifest."""
+    payload = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    paths = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(paths, list) or not paths:
+        raise ValueError(f"Manifest does not contain a non-empty files list: {manifest}")
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"Manifest contains duplicate files: {manifest}")
+    motions = []
+    for path in paths:
+        with np.load(path, allow_pickle=False) as data:
+            if "joint_pos" not in data:
+                raise ValueError(f"Motion has no joint_pos array: {path}")
+            motions.append({"file": path, "frames": int(data["joint_pos"].shape[0])})
+    temporary_reference = output_dir / "motion_lengths.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temporary_reference.write_text(
+        json.dumps({"results": [{"per_motion": motions}]}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    prepare(temporary_reference, output_dir)
+    plan_path = output_dir / "shards.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["source_manifest"] = str(manifest.resolve())
+    plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _merge_checkpoint(checkpoint_results: list[dict], ordered_files: list[str]) -> dict:
@@ -201,6 +229,19 @@ def _format_result(result: dict) -> list[str]:
 def merge(plan_path: pathlib.Path, shard_jsons: list[pathlib.Path], output: pathlib.Path) -> None:
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     payloads = [json.loads(path.read_text(encoding="utf-8")) for path in shard_jsons]
+    bad_sync_versions = [
+        str(path)
+        for path, payload in zip(shard_jsons, payloads, strict=True)
+        if payload.get("frame_zero_reset_sync_version") != RESET_SYNC_VERSION
+    ]
+    if bad_sync_versions:
+        raise RuntimeError(
+            "Refusing to merge shards without frame-zero reset sync version "
+            f"{RESET_SYNC_VERSION}: {bad_sync_versions}"
+        )
+    physics_values = {payload.get("physics") for payload in payloads}
+    if len(physics_values) != 1 or None in physics_values:
+        raise RuntimeError(f"Physics differs across shards: {physics_values}")
     checkpoint_names = [[pathlib.Path(r["checkpoint"]).name for r in p["results"]] for p in payloads]
     if any(names != checkpoint_names[0] for names in checkpoint_names[1:]):
         raise RuntimeError(f"Checkpoint ordering differs across shards: {checkpoint_names}")
@@ -216,6 +257,8 @@ def merge(plan_path: pathlib.Path, shard_jsons: list[pathlib.Path], output: path
         "source_motion_file": plan["reference_json"],
         "evaluation_manifest": str(plan_path.resolve()),
         "seed": first["seed"],
+        "physics": first["physics"],
+        "frame_zero_reset_sync_version": RESET_SYNC_VERSION,
         "num_motions": len(plan["ordered_files"]),
         "num_envs": {s["label"]: s["num_envs"] for s in plan["shards"]},
         "trials_per_motion": first["trials_per_motion"],
@@ -247,6 +290,9 @@ def main() -> None:
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--reference_json", type=pathlib.Path, required=True)
     prepare_parser.add_argument("--output_dir", type=pathlib.Path, required=True)
+    manifest_parser = subparsers.add_parser("prepare-manifest")
+    manifest_parser.add_argument("--manifest", type=pathlib.Path, required=True)
+    manifest_parser.add_argument("--output_dir", type=pathlib.Path, required=True)
     merge_parser = subparsers.add_parser("merge")
     merge_parser.add_argument("--plan", type=pathlib.Path, required=True)
     merge_parser.add_argument("--shard_jsons", type=pathlib.Path, nargs="+", required=True)
@@ -254,6 +300,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args.reference_json, args.output_dir)
+    elif args.command == "prepare-manifest":
+        prepare_manifest(args.manifest, args.output_dir)
     else:
         merge(args.plan, args.shard_jsons, args.output)
 
