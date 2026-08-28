@@ -30,6 +30,18 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def _cfg_curriculum_sampling_strategy(cfg: MotionCommandCfg) -> str:
+    """Read the unified sampler strategy from real or lightweight test config."""
+
+    return str(getattr(cfg, "curriculum_sampling_strategy", "need"))
+
+
+def _cfg_curriculum_learnability_enabled(cfg: MotionCommandCfg) -> bool:
+    return bool(getattr(cfg, "curriculum_unified_window_enabled", False)) and (
+        _cfg_curriculum_sampling_strategy(cfg) == "learnability"
+    )
+
+
 class MotionCommand(CommandTerm):
     cfg: MotionCommandCfg
 
@@ -44,6 +56,11 @@ class MotionCommand(CommandTerm):
     _CURRICULUM_FIXED_HORIZON_SCHEMA_VERSION = 4
     _CURRICULUM_ELIGIBLE_COVERAGE_SCHEMA_VERSION = 5
     _CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION = 6
+    _CURRICULUM_UNIFIED_WINDOW_SCHEMA_VERSION = 7
+    # Schema 8 was produced by the retired fixed-quota V19 experiment.  It is
+    # retained only as a checkpoint migration source.
+    _CURRICULUM_STAGED_SAMPLING_SCHEMA_VERSION = 8
+    _CURRICULUM_LEARNABILITY_SCHEMA_VERSION = 9
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -151,6 +168,32 @@ class MotionCommand(CommandTerm):
                     "curriculum_quality_body_pos_score_cutoff",
                 ):
                     self.metrics[metric_name] = torch.zeros(self.num_envs, device=self.device)
+            if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+                for metric_name in (
+                    "curriculum_unified_known_fraction",
+                    "curriculum_unified_failure_rate",
+                    "curriculum_unified_censored_fraction",
+                    "curriculum_forward_known_fraction",
+                    "curriculum_forward_risk_mean",
+                    "curriculum_need_survival_mean",
+                    "curriculum_need_forward_mean",
+                    "curriculum_need_quality_mean",
+                    "curriculum_need_uncertainty_mean",
+                    "curriculum_target_mass_uniform",
+                    "curriculum_target_mass_need",
+                ):
+                    self.metrics[metric_name] = torch.zeros(self.num_envs, device=self.device)
+                if _cfg_curriculum_learnability_enabled(self.cfg):
+                    for metric_name in (
+                        "curriculum_learnability_primary_support_fraction",
+                        "curriculum_learnability_primary_need_mean",
+                        "curriculum_learnability_primary_scale",
+                        "curriculum_learnability_base_fraction",
+                        "curriculum_learnability_target_entropy",
+                        "curriculum_learnability_quality_reweighted_fraction",
+                        "curriculum_learnability_quality_base_mastered_mass",
+                    ):
+                        self.metrics[metric_name] = torch.zeros(self.num_envs, device=self.device)
             if getattr(self.cfg, "curriculum_detailed_metrics", True):
                 for body_name in self.cfg.body_names:
                     self.metrics[f"curriculum_terminal_body_fraction_{body_name}"] = torch.zeros(
@@ -184,7 +227,47 @@ class MotionCommand(CommandTerm):
 
         return bool(getattr(self.cfg, "curriculum_quality_learning_enabled", False))
 
+    def _curriculum_unified_window_enabled(self) -> bool:
+        """Return whether every consecutive rollout window receives equal credit."""
+
+        return bool(getattr(self.cfg, "curriculum_unified_window_enabled", False))
+
+    def _curriculum_sampling_strategy(self) -> str:
+        """Return the single unified-window sampling strategy."""
+
+        return _cfg_curriculum_sampling_strategy(self.cfg)
+
+    def _curriculum_learnability_sampling_enabled(self) -> bool:
+        """Return whether unified needs use schema-9 learnability priority."""
+
+        return _cfg_curriculum_learnability_enabled(self.cfg)
+
+    def _curriculum_learnability_recipe(self) -> tuple[float, ...]:
+        """Return existing evidence thresholds that define schema-9 priority."""
+
+        return (
+            float(self.cfg.curriculum_beta_prior_alpha),
+            float(self.cfg.curriculum_beta_prior_beta),
+            float(self.cfg.curriculum_min_known_trials),
+            float(self.cfg.curriculum_min_window_trials),
+            float(self.cfg.curriculum_no_progress_threshold),
+            float(self.cfg.curriculum_improvement_threshold),
+            float(self.cfg.curriculum_forward_risk_good_threshold),
+            float(self.cfg.curriculum_forward_risk_bad_threshold),
+            float(self.cfg.curriculum_quality_good_threshold),
+            float(self.cfg.curriculum_quality_bad_threshold),
+            float(self.cfg.curriculum_quality_min_trials),
+            float(self.cfg.curriculum_quality_min_window_trials),
+            float(self.cfg.curriculum_quality_min_windows),
+            float(self.cfg.curriculum_quality_error_ema_alpha),
+            float(self.cfg.curriculum_quality_body_pos_std),
+        )
+
     def _curriculum_checkpoint_schema_version(self) -> int:
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            if _cfg_curriculum_sampling_strategy(self.cfg) == "learnability":
+                return MotionCommand._CURRICULUM_LEARNABILITY_SCHEMA_VERSION
+            return self._CURRICULUM_UNIFIED_WINDOW_SCHEMA_VERSION
         if self._curriculum_quality_learning_enabled():
             return self._CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION
         if self._curriculum_start_eligibility_enabled() or self._curriculum_coverage_aware_enabled():
@@ -292,8 +375,17 @@ class MotionCommand(CommandTerm):
         if coverage_aware_enabled and not eligibility_enabled:
             raise ValueError("coverage-aware curriculum requires curriculum start eligibility")
         quality_learning_enabled = self._curriculum_quality_learning_enabled()
-        if quality_learning_enabled and not eligibility_enabled:
+        unified_window_enabled = bool(getattr(self.cfg, "curriculum_unified_window_enabled", False))
+        self._validate_unified_sampler_enablement(unified_window_enabled)
+        if quality_learning_enabled and not (eligibility_enabled or unified_window_enabled):
             raise ValueError("quality learning requires curriculum start eligibility")
+        if unified_window_enabled:
+            self._validate_unified_window_curriculum_cfg(
+                horizon_frames,
+                eligibility_enabled=eligibility_enabled,
+                coverage_aware_enabled=coverage_aware_enabled,
+                terminal_replay_fraction=terminal_replay_fraction,
+            )
         if quality_learning_enabled:
             learning_pool_fraction = float(getattr(self.cfg, "curriculum_learning_pool_min_fraction", 0.0))
             if not 0.0 < learning_pool_fraction <= 1.0:
@@ -334,6 +426,58 @@ class MotionCommand(CommandTerm):
             if not 0.0 <= focus_start < focus_end <= 1.0:
                 raise ValueError("curriculum state-focus coverage bounds must satisfy 0 <= start < end <= 1")
 
+    def _validate_unified_sampler_enablement(self, unified_window_enabled: bool) -> None:
+        strategy = _cfg_curriculum_sampling_strategy(self.cfg)
+        if strategy not in ("need", "learnability"):
+            raise ValueError("curriculum_sampling_strategy must be 'need' or 'learnability'")
+        if strategy != "need" and not unified_window_enabled:
+            raise ValueError("learnability sampling requires the unified-window curriculum")
+
+    def _validate_unified_window_curriculum_cfg(
+        self,
+        horizon_frames: int | None,
+        *,
+        eligibility_enabled: bool,
+        coverage_aware_enabled: bool,
+        terminal_replay_fraction: float,
+    ) -> None:
+        if horizon_frames is None:
+            raise ValueError("unified-window curriculum requires a fixed window horizon")
+        if int(horizon_frames) != int(self.cfg.bin_size):
+            raise ValueError("unified-window curriculum requires bin_size == curriculum_start_horizon_frames")
+        if eligibility_enabled or coverage_aware_enabled or terminal_replay_fraction != 0.0:
+            raise ValueError(
+                "unified-window curriculum replaces start eligibility, coverage focus, and terminal replay"
+            )
+        if bool(getattr(self.cfg, "resample_at_motion_end", True)):
+            raise ValueError("unified-window curriculum requires an explicit motion_time_out termination")
+        if int(self.cfg.pre_failure_sample_window) != 0:
+            raise ValueError("unified-window all-frame sampling requires pre_failure_sample_window=0")
+        for name in (
+            "curriculum_need_uniform_fraction",
+            "curriculum_forward_risk_decay",
+            "curriculum_forward_risk_good_threshold",
+            "curriculum_forward_risk_bad_threshold",
+            "curriculum_quality_good_threshold",
+            "curriculum_quality_bad_threshold",
+            "curriculum_quarantine_need_scale",
+        ):
+            value = float(getattr(self.cfg, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if int(getattr(self.cfg, "curriculum_forward_risk_horizon_bins")) < 1:
+            raise ValueError("curriculum_forward_risk_horizon_bins must be positive")
+        if not (
+            float(self.cfg.curriculum_forward_risk_good_threshold)
+            < float(self.cfg.curriculum_forward_risk_bad_threshold)
+        ):
+            raise ValueError("curriculum forward-risk good threshold must be below its bad threshold")
+        if not float(self.cfg.curriculum_quality_good_threshold) < float(self.cfg.curriculum_quality_bad_threshold):
+            raise ValueError("curriculum quality good threshold must be below its bad threshold")
+        if _cfg_curriculum_learnability_enabled(self.cfg):
+            if not self._curriculum_quality_learning_enabled():
+                raise ValueError("learnability sampling requires curriculum quality learning")
+
     def _initialize_adaptive_sampling(self) -> None:
         motion_lengths = self._global_time_totals
         self.motion_bin_counts = torch.div(
@@ -361,6 +505,8 @@ class MotionCommand(CommandTerm):
             self.bin_weights /= self.motion_bin_counts[self.bin_motion_ids]
         if self._curriculum_start_eligibility_enabled():
             self._initialize_curriculum_start_geometry()
+        elif bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            self._initialize_curriculum_unified_geometry()
         initial_count = 0.0 if self.cfg.adaptive_sampling_alpha is not None else float(self.cfg.init_num_failures)
         self.adp_samp_num_episodes = torch.full((self.bin_count,), initial_count, device=self.device)
         self.adp_samp_num_failures = torch.full((self.bin_count,), initial_count, device=self.device)
@@ -392,6 +538,20 @@ class MotionCommand(CommandTerm):
             torch.ceil(self._curriculum_eligible_motion_counts.float() * required_fraction).long().clamp_min(1)
         )
 
+    def _initialize_curriculum_unified_geometry(self) -> None:
+        """Expose every valid frame through one ordinary, duration-weighted channel."""
+
+        self._curriculum_eligible_start_ends = self.bin_ends.clone()
+        self._curriculum_eligible_start_counts = self.bin_ends - self.bin_starts
+        self._curriculum_terminal_start_counts = torch.zeros_like(self._curriculum_eligible_start_counts)
+        self._curriculum_eligible_bins = torch.ones(self.bin_count, dtype=torch.bool, device=self.device)
+        self._curriculum_eligible_bin_count = self.bin_count
+        self._curriculum_eligible_motion_counts = self.motion_bin_counts.clone()
+        self._curriculum_eligible_motions = torch.ones(self.global_num_motions, dtype=torch.bool, device=self.device)
+        self._curriculum_provisional_motion_required_counts = torch.ones(
+            self.global_num_motions, dtype=torch.long, device=self.device
+        )
+
     def _initialize_curriculum_sampling(self) -> None:
         """Allocate opt-in start/terminal statistics without affecting the legacy sampler."""
 
@@ -420,6 +580,36 @@ class MotionCommand(CommandTerm):
         self._curriculum_window_start_trials = zeros()
         self._curriculum_window_start_failures = zeros()
 
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            self.curriculum_forward_trials = zeros()
+            self.curriculum_forward_risk_sum = zeros()
+            self._current_curriculum_forward_trials = zeros()
+            self._current_curriculum_forward_risk_sum = zeros()
+            self._curriculum_window_forward_trials = zeros()
+            self._curriculum_window_forward_risk_sum = zeros()
+            self._curriculum_forward_risk_history = torch.full(
+                (3, self.bin_count), float("nan"), dtype=torch.float32, device=self.device
+            )
+            self._curriculum_forward_risk_ema = torch.full(
+                (self.bin_count,), float("nan"), dtype=torch.float32, device=self.device
+            )
+            self._curriculum_forward_observed_windows = torch.zeros(
+                self.bin_count, dtype=torch.uint8, device=self.device
+            )
+            self._curriculum_last_survival_need = zeros()
+            self._curriculum_last_forward_need = zeros()
+            self._curriculum_last_quality_need = zeros()
+            self._curriculum_last_uncertainty_need = zeros()
+            self._curriculum_last_combined_need = zeros()
+            if _cfg_curriculum_learnability_enabled(self.cfg):
+                self._curriculum_last_learnability_base_fraction = 1.0
+                self._curriculum_last_learnability_primary_support_fraction = 0.0
+                self._curriculum_last_learnability_primary_need_mean = 0.0
+                self._curriculum_last_learnability_primary_scale = 0.0
+                self._curriculum_last_learnability_target_entropy = 1.0
+                self._curriculum_last_learnability_quality_reweighted_fraction = 0.0
+                self._curriculum_last_learnability_quality_mastered_mass = 0.0
+
         self._curriculum_failure_rate_history = torch.full(
             (3, self.bin_count), float("nan"), dtype=torch.float32, device=self.device
         )
@@ -436,6 +626,16 @@ class MotionCommand(CommandTerm):
         if self._curriculum_start_eligibility_enabled():
             self._episode_start_label_enabled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._curriculum_body_id_mapping: torch.Tensor | None = None
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            self._episode_unified_window_bins = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+            self._episode_unified_window_frames = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self._episode_unified_window_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self._episode_unified_window_targets = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self._episode_unified_window_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            risk_horizon = int(self.cfg.curriculum_forward_risk_horizon_bins)
+            self._episode_forward_risk_bins = torch.full(
+                (self.num_envs, risk_horizon), -1, dtype=torch.long, device=self.device
+            )
 
         self._curriculum_iteration = 0
         self._curriculum_last_state_update_iteration = 0
@@ -482,10 +682,16 @@ class MotionCommand(CommandTerm):
             self.num_envs, dtype=torch.float32, device=self.device
         )
         self._episode_curriculum_quality_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        target_fraction = float(self.cfg.curriculum_learning_pool_min_fraction)
-        self._curriculum_learning_pool_target_count = int(
-            math.ceil(target_fraction * self._curriculum_eligible_bin_count)
+        self._episode_curriculum_quality_last_time_step = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
         )
+        target_fraction = float(self.cfg.curriculum_learning_pool_min_fraction)
+        learning_bin_count = (
+            self.bin_count
+            if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False))
+            else self._curriculum_eligible_bin_count
+        )
+        self._curriculum_learning_pool_target_count = int(math.ceil(target_fraction * learning_bin_count))
         self._curriculum_quality_filler_count = 0
         self._curriculum_quality_error_cutoff = 0.0
 
@@ -686,29 +892,41 @@ class MotionCommand(CommandTerm):
             self._accumulate_curriculum_quality_error()
 
     def _accumulate_curriculum_quality_error(self) -> None:
-        """Accumulate pre-reset, reward-aligned body-position error for pending starts."""
+        """Accumulate pre-reset, reward-aligned body-position error for the active window."""
 
         if not (
             hasattr(self, "last_global_body_pos_errors") and hasattr(self, "last_global_body_pos_error_time_steps")
         ):
             return
 
-        pending = (
-            self._has_sampled
-            & self._episode_start_label_enabled
-            & ~self._episode_start_outcome_recorded
-            & self._episode_curriculum_quality_valid
-            & ~self._env.reset_buf
-            & ~self._env.reset_terminated
-            & ~self._env.reset_time_outs
-            & (self.last_global_body_pos_error_time_steps == self.time_steps)
-        )
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            pending = (
+                self._has_sampled
+                & self._episode_unified_window_active
+                & self._episode_curriculum_quality_valid
+                & ~self._env.reset_buf
+                & ~self._env.reset_terminated
+                & ~self._env.reset_time_outs
+                & (self.last_global_body_pos_error_time_steps == self.time_steps)
+            )
+        else:
+            pending = (
+                self._has_sampled
+                & self._episode_start_label_enabled
+                & ~self._episode_start_outcome_recorded
+                & self._episode_curriculum_quality_valid
+                & ~self._env.reset_buf
+                & ~self._env.reset_terminated
+                & ~self._env.reset_time_outs
+                & (self.last_global_body_pos_error_time_steps == self.time_steps)
+            )
         quality_mse = torch.square(self.last_global_body_pos_errors).mean(dim=-1)
         finite = torch.isfinite(quality_mse)
         self._episode_curriculum_quality_valid[pending & ~finite] = False
         observed = pending & finite
         self._episode_curriculum_quality_error_sum.add_(torch.where(observed, quality_mse, 0.0))
         self._episode_curriculum_quality_observation_count.add_(observed)
+        self._episode_curriculum_quality_last_time_step[observed] = self.time_steps[observed]
 
     def _record_curriculum_start_quality(self, env_ids: torch.Tensor) -> None:
         """Record one complete-horizon quality observation per successful start."""
@@ -731,6 +949,202 @@ class MotionCommand(CommandTerm):
             0, start_bins, torch.ones_like(start_bins, dtype=torch.float32)
         )
         self._current_curriculum_quality_error_sum.index_add_(0, start_bins, quality_score)
+
+    def _reset_curriculum_window_quality(self, env_ids: torch.Tensor, *, valid: bool = True) -> None:
+        """Reset quality accumulation independently for each unified window."""
+
+        if not self._curriculum_quality_learning_enabled() or len(env_ids) == 0:
+            return
+        self._episode_curriculum_quality_error_sum[env_ids] = 0.0
+        self._episode_curriculum_quality_observation_count[env_ids] = 0.0
+        self._episode_curriculum_quality_valid[env_ids] = valid
+        self._episode_curriculum_quality_last_time_step[env_ids] = -1
+
+    def _record_curriculum_unified_window_quality(self, env_ids: torch.Tensor) -> None:
+        """Write successful start and transit quality into the same per-bin arrays."""
+
+        if not self._curriculum_quality_learning_enabled() or len(env_ids) == 0:
+            return
+        observation_count = self._episode_curriculum_quality_observation_count[env_ids]
+        valid = self._episode_curriculum_quality_valid[env_ids] & (observation_count > 0.0)
+        valid_env_ids = env_ids[valid]
+        if len(valid_env_ids) == 0:
+            return
+        window_bins = self._episode_unified_window_bins[valid_env_ids]
+        mean_quality_mse = (
+            self._episode_curriculum_quality_error_sum[valid_env_ids]
+            / self._episode_curriculum_quality_observation_count[valid_env_ids]
+        )
+        std = float(self.cfg.curriculum_quality_body_pos_std)
+        quality_score = 1.0 - torch.exp(-mean_quality_mse / (std * std))
+        self._current_curriculum_quality_trials.index_add_(
+            0, window_bins, torch.ones_like(window_bins, dtype=torch.float32)
+        )
+        self._current_curriculum_quality_error_sum.index_add_(0, window_bins, quality_score)
+
+    def _initialize_curriculum_unified_episode(self, env_ids: torch.Tensor) -> None:
+        """Start one non-overlapping window chain at each environment's sampled frame."""
+
+        if len(env_ids) == 0:
+            return
+        start_frames = self.time_steps[env_ids]
+        start_bins = self._bucket_ids(self.motion_ids[env_ids], start_frames)
+        horizon = int(self.cfg.curriculum_start_horizon_frames)
+        remaining = (self.motion_lengths[env_ids] - start_frames).clamp_min(1)
+        self._episode_unified_window_bins[env_ids] = start_bins
+        self._episode_unified_window_frames[env_ids] = start_frames
+        self._episode_unified_window_steps[env_ids] = 0
+        self._episode_unified_window_targets[env_ids] = torch.minimum(remaining, torch.full_like(remaining, horizon))
+        self._episode_unified_window_active[env_ids] = True
+        self._episode_forward_risk_bins[env_ids] = -1
+        self._reset_curriculum_window_quality(env_ids)
+
+    def _record_curriculum_unified_window_outcomes(
+        self, env_ids: torch.Tensor, *, failed: bool, include_terminal_frame: bool = False
+    ) -> None:
+        """Record one local trial for every active start or transit window."""
+
+        if len(env_ids) == 0:
+            return
+        active = self._episode_unified_window_active[env_ids]
+        env_ids = env_ids[active]
+        if len(env_ids) == 0:
+            return
+        window_bins = self._episode_unified_window_bins[env_ids]
+        ones = torch.ones_like(window_bins, dtype=torch.float32)
+        self._current_curriculum_start_trials.index_add_(0, window_bins, ones)
+        if failed:
+            self._current_curriculum_start_failures.index_add_(0, window_bins, ones)
+        else:
+            self._record_curriculum_unified_window_quality(env_ids)
+        steps = self._episode_unified_window_steps[env_ids].float()
+        targets = self._episode_unified_window_targets[env_ids].clamp_min(1).float()
+        if include_terminal_frame:
+            # A terminating frame is observed by the termination manager but
+            # does not reach _update_adaptive_exposure(). Include it here.
+            steps = torch.minimum(steps + 1.0, targets)
+        completion = torch.ones_like(steps) if not failed else (steps / targets).clamp_(0.0, 1.0)
+        self._current_curriculum_start_survival_steps.index_add_(0, window_bins, steps)
+        self._current_curriculum_start_completion_fraction.index_add_(0, window_bins, completion)
+        self._episode_unified_window_active[env_ids] = False
+
+    def _accumulate_curriculum_terminal_quality(self, env_ids: torch.Tensor) -> None:
+        """Include the natural motion-ending frame in a successful tail window."""
+
+        if not self._curriculum_quality_learning_enabled() or len(env_ids) == 0:
+            return
+        if not (
+            hasattr(self, "last_global_body_pos_errors") and hasattr(self, "last_global_body_pos_error_time_steps")
+        ):
+            return
+        active = self._episode_unified_window_active[env_ids] & self._episode_curriculum_quality_valid[env_ids]
+        current = (self.last_global_body_pos_error_time_steps[env_ids] == self.time_steps[env_ids]) & (
+            self._episode_curriculum_quality_last_time_step[env_ids] != self.time_steps[env_ids]
+        )
+        candidate_env_ids = env_ids[active & current]
+        if len(candidate_env_ids) == 0:
+            return
+        quality_mse = torch.square(self.last_global_body_pos_errors[candidate_env_ids]).mean(dim=-1)
+        finite = torch.isfinite(quality_mse)
+        self._episode_curriculum_quality_valid[candidate_env_ids[~finite]] = False
+        observed_env_ids = candidate_env_ids[finite]
+        self._episode_curriculum_quality_error_sum[observed_env_ids] += quality_mse[finite]
+        self._episode_curriculum_quality_observation_count[observed_env_ids] += 1.0
+        self._episode_curriculum_quality_last_time_step[observed_env_ids] = self.time_steps[observed_env_ids]
+
+    def _record_curriculum_unified_window_censored(self, env_ids: torch.Tensor) -> None:
+        """Censor an interrupted partial window without turning it into a failure."""
+
+        if len(env_ids) == 0:
+            return
+        active = self._episode_unified_window_active[env_ids]
+        env_ids = env_ids[active]
+        if len(env_ids) == 0:
+            return
+        window_bins = self._episode_unified_window_bins[env_ids]
+        ones = torch.ones_like(window_bins, dtype=torch.float32)
+        self._current_curriculum_start_censored.index_add_(0, window_bins, ones)
+        steps = self._episode_unified_window_steps[env_ids].float()
+        targets = self._episode_unified_window_targets[env_ids].clamp_min(1).float()
+        self._current_curriculum_start_survival_steps.index_add_(0, window_bins, steps)
+        self._current_curriculum_start_completion_fraction.index_add_(
+            0, window_bins, (steps / targets).clamp_(0.0, 1.0)
+        )
+        self._episode_unified_window_active[env_ids] = False
+
+    def _advance_curriculum_unified_windows(self, env_ids: torch.Tensor) -> None:
+        """Close completed windows and open the next anchor without overlap."""
+
+        if len(env_ids) == 0:
+            return
+        self._record_curriculum_unified_window_outcomes(env_ids, failed=False)
+        next_frames = self._episode_unified_window_frames[env_ids] + self._episode_unified_window_targets[env_ids]
+        has_next = next_frames < self.motion_lengths[env_ids]
+        next_env_ids = env_ids[has_next]
+        if len(next_env_ids) == 0:
+            return
+        next_frames = next_frames[has_next]
+        horizon = int(self.cfg.curriculum_start_horizon_frames)
+        remaining = self.motion_lengths[next_env_ids] - next_frames
+        self._episode_unified_window_frames[next_env_ids] = next_frames
+        self._episode_unified_window_bins[next_env_ids] = self._bucket_ids(self.motion_ids[next_env_ids], next_frames)
+        self._episode_unified_window_steps[next_env_ids] = 0
+        self._episode_unified_window_targets[next_env_ids] = torch.minimum(
+            remaining, torch.full_like(remaining, horizon)
+        )
+        self._episode_unified_window_active[next_env_ids] = True
+        self._reset_curriculum_window_quality(next_env_ids)
+
+    def _record_curriculum_forward_outcomes(self, env_ids: torch.Tensor, *, failed: bool) -> None:
+        """Resolve all pending K-bin lookahead cohorts for an episode."""
+
+        if len(env_ids) == 0:
+            return
+        history = self._episode_forward_risk_bins[env_ids]
+        valid = history >= 0
+        if not torch.any(valid):
+            self._episode_forward_risk_bins[env_ids] = -1
+            return
+        flat_bins = history[valid]
+        ones = torch.ones_like(flat_bins, dtype=torch.float32)
+        self._current_curriculum_forward_trials.index_add_(0, flat_bins, ones)
+        if failed:
+            distances = torch.arange(history.shape[1], dtype=torch.float32, device=self.device)
+            weights = float(self.cfg.curriculum_forward_risk_decay) ** distances
+            scores = weights.unsqueeze(0).expand_as(history)[valid]
+            self._current_curriculum_forward_risk_sum.index_add_(0, flat_bins, scores)
+        self._episode_forward_risk_bins[env_ids] = -1
+
+    def _enter_curriculum_forward_bins(self, env_ids: torch.Tensor, bin_ids: torch.Tensor) -> None:
+        """Open a lookahead cohort and safely resolve the one leaving K-bin history."""
+
+        if len(env_ids) == 0:
+            return
+        history = self._episode_forward_risk_bins[env_ids]
+        expired = history[:, -1]
+        valid_expired = expired >= 0
+        expired_bins = expired[valid_expired]
+        self._current_curriculum_forward_trials.index_add_(
+            0, expired_bins, torch.ones_like(expired_bins, dtype=torch.float32)
+        )
+        shifted = history.clone()
+        if shifted.shape[1] > 1:
+            shifted[:, 1:] = history[:, :-1]
+        shifted[:, 0] = bin_ids
+        self._episode_forward_risk_bins[env_ids] = shifted
+
+    def _update_curriculum_unified_windows(self, env_ids: torch.Tensor) -> None:
+        """Advance active V18 windows once for the current reference frame."""
+
+        if len(env_ids) == 0:
+            return
+        active = self._episode_unified_window_active[env_ids]
+        env_ids = env_ids[active]
+        if len(env_ids) == 0:
+            return
+        self._episode_unified_window_steps[env_ids] += 1
+        complete = self._episode_unified_window_steps[env_ids] >= self._episode_unified_window_targets[env_ids]
+        self._advance_curriculum_unified_windows(env_ids[complete])
 
     def _bucket_ids(self, motion_ids: torch.Tensor, time_steps: torch.Tensor) -> torch.Tensor:
         global_motion_ids = self.motion.global_ids[motion_ids]
@@ -973,6 +1387,11 @@ class MotionCommand(CommandTerm):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return endpoint total, comparable-start, and terminal-replay mass."""
 
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            probabilities = self._curriculum_unified_need_probabilities(active_bin_ids, dtype=dtype)
+            zeros = torch.zeros_like(probabilities)
+            return probabilities, probabilities, zeros
+
         if not self._curriculum_start_eligibility_enabled():
             probabilities = self._curriculum_state_budget_probabilities(active_bin_ids, dtype=dtype)
             zeros = torch.zeros_like(probabilities)
@@ -1041,6 +1460,233 @@ class MotionCommand(CommandTerm):
         eligible_component *= normalization
         terminal_component *= normalization
         return probabilities, eligible_component, terminal_component
+
+    @staticmethod
+    def _normalize_curriculum_need(values: torch.Tensor, good: float, bad: float) -> torch.Tensor:
+        """Map one calibrated diagnostic range into a bounded need score."""
+
+        return ((values - good) / (bad - good)).clamp_(0.0, 1.0)
+
+    def _curriculum_quality_evidence_mask(self) -> torch.Tensor:
+        """Return bins with enough successful-window quality evidence."""
+
+        return (
+            (self.curriculum_quality_trials >= float(self.cfg.curriculum_quality_min_trials))
+            & (self._curriculum_quality_observed_windows >= int(self.cfg.curriculum_quality_min_windows))
+            & torch.isfinite(self._curriculum_quality_error_ema)
+        )
+
+    @staticmethod
+    def _curriculum_normalized_entropy(probabilities: torch.Tensor) -> torch.Tensor:
+        """Return Shannon entropy normalized by the distribution size."""
+
+        if probabilities.numel() <= 1:
+            return probabilities.new_ones(())
+        tiny = torch.finfo(probabilities.dtype).tiny
+        entropy = -(probabilities * probabilities.clamp_min(tiny).log()).sum()
+        return entropy / math.log(probabilities.numel())
+
+    def _curriculum_recent_progress_need(
+        self,
+        active_bin_ids: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return positive local/forward progress calibrated by state thresholds."""
+
+        no_progress = float(self.cfg.curriculum_no_progress_threshold)
+        improvement = float(self.cfg.curriculum_improvement_threshold)
+
+        def normalized(history: torch.Tensor) -> torch.Tensor:
+            active_history = history[:, active_bin_ids].to(dtype=dtype)
+            finite = torch.isfinite(active_history).all(dim=0)
+            progress = active_history[0] - active_history[2]
+            progress = ((progress - no_progress) / (improvement - no_progress)).clamp_(0.0, 1.0)
+            return torch.where(finite, progress, torch.zeros_like(progress))
+
+        return torch.maximum(
+            normalized(self._curriculum_failure_rate_history),
+            normalized(self._curriculum_forward_risk_history),
+        )
+
+    def _curriculum_quality_base_coverage(
+        self,
+        active_bin_ids: torch.Tensor,
+        uniform_probabilities: torch.Tensor,
+        quality_need: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reweight quality within MASTERED while preserving its base mass exactly."""
+
+        coverage = uniform_probabilities.clone()
+        mastered = self._curriculum_states[active_bin_ids] == self._CURRICULUM_MASTERED
+        quality_known = self._curriculum_quality_evidence_mask()[active_bin_ids]
+        quality_mastered = mastered & quality_known
+        mastered_mass = uniform_probabilities[mastered].sum()
+        if mastered_mass > 0.0 and torch.any(quality_mastered):
+            factors = torch.ones_like(quality_need)
+            factors[quality_mastered] += quality_need[quality_mastered]
+            reweighted = uniform_probabilities[mastered] * factors[mastered]
+            coverage[mastered] = reweighted * (mastered_mass / reweighted.sum())
+        return coverage / coverage.sum()
+
+    def _curriculum_learnability_probabilities(
+        self,
+        active_bin_ids: torch.Tensor,
+        frame_weights: torch.Tensor,
+        survival_need: torch.Tensor,
+        forward_need: torch.Tensor,
+        quality_need: torch.Tensor,
+        local_uncertainty_need: torch.Tensor,
+        forward_uncertainty_need: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Add self-normalized learnability priority to quality-shaped coverage."""
+
+        uniform_probabilities = frame_weights / frame_weights.sum()
+        quality_coverage = self._curriculum_quality_base_coverage(
+            active_bin_ids,
+            uniform_probabilities,
+            quality_need,
+        )
+
+        uncertainty_need = torch.maximum(local_uncertainty_need, forward_uncertainty_need)
+        progress_need = self._curriculum_recent_progress_need(active_bin_ids, dtype=dtype)
+        difficulty_need = torch.maximum(survival_need, forward_need)
+        learnability_need = torch.maximum(uncertainty_need, progress_need)
+        primary_need = difficulty_need * learnability_need
+        primary_support = primary_need > 0.0
+
+        if torch.any(primary_support):
+            # The scale is supplied by the current positive evidence itself:
+            # an average learnable bin receives a 2x multiplier over its base
+            # coverage, without a hand-set pool fraction or entropy target.
+            positive_frame_weights = frame_weights[primary_support]
+            primary_scale = (primary_need[primary_support] * positive_frame_weights).sum()
+            primary_scale /= positive_frame_weights.sum()
+            priority_multiplier = 1.0 + primary_need / primary_scale
+            unnormalized = quality_coverage * priority_multiplier
+            normalization = unnormalized.sum()
+            probabilities = unnormalized / normalization
+            base_fraction = float((1.0 / normalization).item())
+        else:
+            probabilities = quality_coverage
+            primary_scale = primary_need.new_zeros(())
+            base_fraction = 1.0
+
+        self._curriculum_last_learnability_base_fraction = base_fraction
+        self._curriculum_last_learnability_primary_support_fraction = float(primary_support.float().mean().item())
+        self._curriculum_last_learnability_primary_need_mean = float(primary_need.mean().item())
+        self._curriculum_last_learnability_primary_scale = float(primary_scale.item())
+        self._curriculum_last_learnability_target_entropy = float(
+            self._curriculum_normalized_entropy(probabilities).item()
+        )
+        mastered = self._curriculum_states[active_bin_ids] == self._CURRICULUM_MASTERED
+        quality_reweighted = mastered & self._curriculum_quality_evidence_mask()[active_bin_ids] & (quality_need > 0.0)
+        self._curriculum_last_learnability_quality_reweighted_fraction = float(
+            quality_reweighted.float().mean().item()
+        )
+        self._curriculum_last_learnability_quality_mastered_mass = float(
+            (quality_coverage[mastered].sum() * base_fraction).item()
+        )
+        return probabilities / probabilities.sum(), primary_need, uncertainty_need
+
+    def _curriculum_unified_need_probabilities(
+        self, active_bin_ids: torch.Tensor, *, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Mix an all-frame floor with continuous V18 learning need."""
+
+        prior_alpha = float(self.cfg.curriculum_beta_prior_alpha)
+        prior_beta = float(self.cfg.curriculum_beta_prior_beta)
+        trials = self.curriculum_start_trials[active_bin_ids].to(dtype=dtype)
+        failures = self.curriculum_start_failures[active_bin_ids].to(dtype=dtype)
+        # Sampling need uses all unified start/transit outcomes.  Recent
+        # decision windows remain deliberately separate for state hysteresis;
+        # eight fresh outcomes must not replace a large cumulative estimate.
+        local_rate = (failures + prior_alpha) / (trials + prior_alpha + prior_beta)
+        survival_need = self._normalize_curriculum_need(local_rate, 0.10, 0.90)
+
+        forward_known = self.curriculum_forward_trials[active_bin_ids] >= float(self.cfg.curriculum_min_known_trials)
+        forward_rate = torch.nan_to_num(
+            self._curriculum_forward_risk_ema[active_bin_ids].to(dtype=dtype),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        recent_forward_trials = self._curriculum_window_forward_trials[active_bin_ids].to(dtype=dtype)
+        recent_forward_rate = self._curriculum_window_forward_risk_sum[active_bin_ids].to(
+            dtype=dtype
+        ) / recent_forward_trials.clamp_min(1.0)
+        forward_rate = torch.where(
+            recent_forward_trials >= float(self.cfg.curriculum_min_window_trials),
+            recent_forward_rate,
+            forward_rate,
+        )
+        forward_need = self._normalize_curriculum_need(
+            forward_rate,
+            float(self.cfg.curriculum_forward_risk_good_threshold),
+            float(self.cfg.curriculum_forward_risk_bad_threshold),
+        )
+        forward_need *= forward_known
+
+        if self._curriculum_quality_learning_enabled():
+            quality_known = self._curriculum_quality_evidence_mask()[active_bin_ids]
+            quality_score = torch.nan_to_num(
+                self._curriculum_quality_error_ema[active_bin_ids].to(dtype=dtype),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            )
+            quality_need = self._normalize_curriculum_need(
+                quality_score,
+                float(self.cfg.curriculum_quality_good_threshold),
+                float(self.cfg.curriculum_quality_bad_threshold),
+            )
+            quality_need *= quality_known
+        else:
+            quality_need = torch.zeros_like(survival_need)
+        uncertainty_need = (1.0 - trials / float(self.cfg.curriculum_min_known_trials)).clamp_(0.0, 1.0)
+        forward_uncertainty_need = (
+            1.0
+            - self.curriculum_forward_trials[active_bin_ids].to(dtype=dtype)
+            / float(self.cfg.curriculum_min_known_trials)
+        ).clamp_(0.0, 1.0)
+
+        need = torch.maximum(
+            torch.maximum(survival_need, forward_need),
+            torch.maximum(quality_need, uncertainty_need),
+        )
+        quarantine = self._curriculum_states[active_bin_ids] == self._CURRICULUM_QUARANTINE
+        need[quarantine] *= float(self.cfg.curriculum_quarantine_need_scale)
+
+        frame_weights = (self.bin_ends[active_bin_ids] - self.bin_starts[active_bin_ids]).to(dtype=dtype)
+        if _cfg_curriculum_learnability_enabled(self.cfg):
+            probabilities, need, uncertainty_need = self._curriculum_learnability_probabilities(
+                active_bin_ids,
+                frame_weights,
+                survival_need,
+                forward_need,
+                quality_need,
+                uncertainty_need,
+                forward_uncertainty_need,
+                dtype=dtype,
+            )
+        else:
+            uniform_probabilities = frame_weights / frame_weights.sum()
+            adaptive_weights = need * frame_weights
+            if adaptive_weights.sum() > 0.0:
+                need_probabilities = adaptive_weights / adaptive_weights.sum()
+            else:
+                need_probabilities = uniform_probabilities
+            uniform_fraction = float(self.cfg.curriculum_need_uniform_fraction)
+            probabilities = uniform_probabilities * uniform_fraction + need_probabilities * (1.0 - uniform_fraction)
+
+        self._curriculum_last_survival_need[active_bin_ids] = survival_need.detach().float()
+        self._curriculum_last_forward_need[active_bin_ids] = forward_need.detach().float()
+        self._curriculum_last_quality_need[active_bin_ids] = quality_need.detach().float()
+        self._curriculum_last_uncertainty_need[active_bin_ids] = uncertainty_need.detach().float()
+        self._curriculum_last_combined_need[active_bin_ids] = need.detach().float()
+        return probabilities / probabilities.sum()
 
     def _curriculum_shadow_distribution(
         self, legacy_probabilities: torch.Tensor, active_bin_ids: torch.Tensor
@@ -1156,6 +1802,7 @@ class MotionCommand(CommandTerm):
             metric_bin_ids = active_bin_ids[active_eligible_mask]
             metric_probabilities = probabilities[active_eligible_mask]
         else:
+            active_eligible_mask = torch.ones(len(active_bin_ids), dtype=torch.bool, device=self.device)
             metric_bin_ids = active_bin_ids
             metric_probabilities = probabilities
         active_states = self._curriculum_states[metric_bin_ids].long()
@@ -1218,9 +1865,12 @@ class MotionCommand(CommandTerm):
             quality_fillers = self._curriculum_quality_filler_mask[metric_bin_ids]
             survival_frontier = active_states == self._CURRICULUM_FRONTIER
             learning_pool = survival_frontier | quality_fillers
-            quality_sampling_probabilities = self._curriculum_active_eligible_component_probabilities[
-                active_eligible_mask
-            ]
+            if self._curriculum_start_eligibility_enabled():
+                quality_sampling_probabilities = self._curriculum_active_eligible_component_probabilities[
+                    active_eligible_mask
+                ]
+            else:
+                quality_sampling_probabilities = metric_probabilities
             quality_known_float = quality_known.float()
             quality_errors = torch.nan_to_num(
                 self._curriculum_quality_error_ema[metric_bin_ids], nan=0.0, posinf=0.0, neginf=0.0
@@ -1240,6 +1890,61 @@ class MotionCommand(CommandTerm):
                     ),
                 }
             )
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            forward_known = self.curriculum_forward_trials[metric_bin_ids] >= float(
+                self.cfg.curriculum_min_known_trials
+            )
+            forward_values = torch.nan_to_num(
+                self._curriculum_forward_risk_ema[metric_bin_ids], nan=0.0, posinf=1.0, neginf=0.0
+            )
+            forward_mean = (forward_values * forward_known.float()).sum() / forward_known.float().sum().clamp_min(1.0)
+            blend = self._curriculum_blend_factor()
+            target_mass = probabilities.new_tensor(blend)
+            if _cfg_curriculum_learnability_enabled(self.cfg):
+                base_fraction = self._curriculum_last_learnability_base_fraction
+            else:
+                base_fraction = float(self.cfg.curriculum_need_uniform_fraction)
+            metric_values.update(
+                {
+                    "curriculum_unified_known_fraction": probabilities.new_tensor(self._curriculum_known_fraction),
+                    "curriculum_unified_failure_rate": start_failure_rate,
+                    "curriculum_unified_censored_fraction": start_censored_fraction,
+                    "curriculum_forward_known_fraction": forward_known.float().mean(),
+                    "curriculum_forward_risk_mean": forward_mean,
+                    "curriculum_need_survival_mean": self._curriculum_last_survival_need[metric_bin_ids].mean(),
+                    "curriculum_need_forward_mean": self._curriculum_last_forward_need[metric_bin_ids].mean(),
+                    "curriculum_need_quality_mean": self._curriculum_last_quality_need[metric_bin_ids].mean(),
+                    "curriculum_need_uncertainty_mean": self._curriculum_last_uncertainty_need[metric_bin_ids].mean(),
+                    "curriculum_target_mass_uniform": target_mass * base_fraction,
+                    "curriculum_target_mass_need": target_mass * (1.0 - base_fraction),
+                }
+            )
+            if _cfg_curriculum_learnability_enabled(self.cfg):
+                metric_values.update(
+                    {
+                        "curriculum_learnability_primary_support_fraction": probabilities.new_tensor(
+                            self._curriculum_last_learnability_primary_support_fraction
+                        ),
+                        "curriculum_learnability_primary_need_mean": probabilities.new_tensor(
+                            self._curriculum_last_learnability_primary_need_mean
+                        ),
+                        "curriculum_learnability_primary_scale": probabilities.new_tensor(
+                            self._curriculum_last_learnability_primary_scale
+                        ),
+                        "curriculum_learnability_base_fraction": probabilities.new_tensor(
+                            self._curriculum_last_learnability_base_fraction
+                        ),
+                        "curriculum_learnability_target_entropy": probabilities.new_tensor(
+                            self._curriculum_last_learnability_target_entropy
+                        ),
+                        "curriculum_learnability_quality_reweighted_fraction": probabilities.new_tensor(
+                            self._curriculum_last_learnability_quality_reweighted_fraction
+                        ),
+                        "curriculum_learnability_quality_base_mastered_mass": probabilities.new_tensor(
+                            self._curriculum_last_learnability_quality_mastered_mass
+                        ),
+                    }
+                )
         for state_id, state_name in enumerate(self._CURRICULUM_STATE_NAMES):
             metric_values[f"curriculum_state_fraction_{state_name}"] = state_fractions[state_id]
             mass_metric_name = f"curriculum_sampling_mass_{state_name}"
@@ -1284,6 +1989,10 @@ class MotionCommand(CommandTerm):
 
     def _update_curriculum_states(self) -> None:
         """Advance the five-state hysteretic classifier from one disjoint window."""
+
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            self._update_curriculum_unified_states()
+            return
 
         window_trials = self._curriculum_window_start_trials
         window_failures = self._curriculum_window_start_failures
@@ -1389,6 +2098,152 @@ class MotionCommand(CommandTerm):
             self._refresh_curriculum_quality_learning_pool()
         self._curriculum_last_state_update_iteration = self._curriculum_iteration
 
+    @staticmethod
+    def _shift_curriculum_history(history: torch.Tensor, valid: torch.Tensor, values: torch.Tensor) -> None:
+        """Append one value to the three-window history of each valid bin."""
+
+        if not torch.any(valid):
+            return
+        previous_middle = history[1, valid].clone()
+        previous_latest = history[2, valid].clone()
+        history[0, valid] = previous_middle
+        history[1, valid] = previous_latest
+        history[2, valid] = values[valid]
+
+    def _update_curriculum_unified_states(self) -> None:
+        """Update V18 labels from unified local evidence plus non-cancelling future risk."""
+
+        prior_alpha = float(self.cfg.curriculum_beta_prior_alpha)
+        prior_beta = float(self.cfg.curriculum_beta_prior_beta)
+        min_window = float(self.cfg.curriculum_min_window_trials)
+
+        local_trials = self._curriculum_window_start_trials
+        local_rate = (self._curriculum_window_start_failures + prior_alpha) / (local_trials + prior_alpha + prior_beta)
+        local_known = self._curriculum_known_mask()
+        local_valid = (local_trials >= min_window) & local_known
+        self._shift_curriculum_history(self._curriculum_failure_rate_history, local_valid, local_rate)
+
+        forward_trials = self._curriculum_window_forward_trials
+        forward_rate = self._curriculum_window_forward_risk_sum / forward_trials.clamp_min(1.0)
+        forward_known = self.curriculum_forward_trials >= float(self.cfg.curriculum_min_known_trials)
+        forward_valid = (forward_trials >= min_window) & forward_known
+        forward_history = self._curriculum_forward_risk_history
+        self._shift_curriculum_history(forward_history, forward_valid, forward_rate)
+        if torch.any(forward_valid):
+            previous = self._curriculum_forward_risk_ema[forward_valid]
+            alpha = 0.5
+            updated = torch.where(
+                torch.isfinite(previous), previous.lerp(forward_rate[forward_valid], alpha), forward_rate[forward_valid]
+            )
+            self._curriculum_forward_risk_ema[forward_valid] = updated
+            observed = self._curriculum_forward_observed_windows[forward_valid].to(torch.int16)
+            self._curriculum_forward_observed_windows[forward_valid] = (observed + 1).clamp_max(255).to(torch.uint8)
+
+        local_history = self._curriculum_failure_rate_history
+        local_finite = torch.isfinite(local_history)
+        forward_finite = torch.isfinite(forward_history)
+        local_low_two = local_finite[1:].all(dim=0) & (
+            local_history[1:] <= float(self.cfg.curriculum_mastered_enter_threshold)
+        ).all(dim=0)
+        forward_low_two = forward_finite[1:].all(dim=0) & (forward_history[1:] <= 0.10).all(dim=0)
+        forward_safe = ~forward_known | forward_low_two
+        mastered_evidence = local_low_two & forward_safe
+
+        local_progress = local_history[0] - local_history[2]
+        forward_progress = forward_history[0] - forward_history[2]
+        local_no_progress = local_finite.all(dim=0) & (
+            local_progress < float(self.cfg.curriculum_no_progress_threshold)
+        )
+        forward_no_progress = forward_finite.all(dim=0) & (
+            forward_progress < float(self.cfg.curriculum_no_progress_threshold)
+        )
+        local_strong_improvement = local_finite.all(dim=0) & (
+            local_progress >= float(self.cfg.curriculum_improvement_threshold)
+        )
+        forward_strong_improvement = forward_finite.all(dim=0) & (
+            forward_progress >= float(self.cfg.curriculum_improvement_threshold)
+        )
+        local_stalled = (
+            local_finite.all(dim=0)
+            & (local_history >= float(self.cfg.curriculum_stalled_enter_threshold)).all(dim=0)
+            & local_no_progress
+        )
+        forward_stalled = (
+            forward_finite.all(dim=0)
+            & (forward_history >= float(self.cfg.curriculum_forward_risk_bad_threshold)).all(dim=0)
+            & forward_no_progress
+        )
+        local_quarantine = (
+            local_finite.all(dim=0)
+            & (local_history >= float(self.cfg.curriculum_quarantine_enter_threshold)).all(dim=0)
+            & local_no_progress
+        )
+
+        current_local = local_history[2]
+        current_forward = forward_history[2]
+        any_current_valid = local_valid | forward_valid
+        mastered_exit = (local_valid & (current_local > float(self.cfg.curriculum_mastered_exit_threshold))) | (
+            forward_valid & (current_forward > 0.20)
+        )
+
+        previous_states = self._curriculum_states.clone()
+        next_states = previous_states.clone()
+        unknown = (previous_states == self._CURRICULUM_UNKNOWN) & local_valid
+        next_states[unknown & mastered_evidence] = self._CURRICULUM_MASTERED
+        next_states[unknown & ~mastered_evidence] = self._CURRICULUM_FRONTIER
+
+        mastered = (previous_states == self._CURRICULUM_MASTERED) & any_current_valid
+        next_states[mastered & mastered_exit] = self._CURRICULUM_FRONTIER
+
+        frontier = (previous_states == self._CURRICULUM_FRONTIER) & any_current_valid
+        next_states[frontier & mastered_evidence] = self._CURRICULUM_MASTERED
+        fresh_stall_evidence = (local_valid & local_stalled) | (forward_valid & forward_stalled)
+        next_states[frontier & ~mastered_evidence & fresh_stall_evidence] = self._CURRICULUM_STALLED
+
+        stalled = (previous_states == self._CURRICULUM_STALLED) & any_current_valid
+        stalled_to_mastered = stalled & mastered_evidence
+        all_active_reasons_improved = (
+            ~local_stalled
+            | local_strong_improvement
+            | (current_local < float(self.cfg.curriculum_stalled_exit_threshold))
+        ) & (~forward_stalled | forward_strong_improvement | (current_forward < 0.50))
+        stalled_to_frontier = stalled & ~stalled_to_mastered & all_active_reasons_improved
+        stalled_to_quarantine = (
+            stalled
+            & local_valid
+            & ~stalled_to_mastered
+            & ~stalled_to_frontier
+            & (self.curriculum_start_trials >= float(self.cfg.curriculum_min_quarantine_trials))
+            & local_quarantine
+            & self._curriculum_forward_terminal_hard_mask()
+        )
+        next_states[stalled_to_mastered] = self._CURRICULUM_MASTERED
+        next_states[stalled_to_frontier] = self._CURRICULUM_FRONTIER
+        next_states[stalled_to_quarantine] = self._CURRICULUM_QUARANTINE
+
+        entered_quarantine = (next_states == self._CURRICULUM_QUARANTINE) & (
+            previous_states != self._CURRICULUM_QUARANTINE
+        )
+        self._curriculum_state_entry_trials[entered_quarantine] = self.curriculum_start_trials[entered_quarantine]
+        quarantine = (previous_states == self._CURRICULUM_QUARANTINE) & local_valid
+        probe_trials = self.curriculum_start_trials - self._curriculum_state_entry_trials
+        quarantine_exit = (
+            quarantine
+            & (probe_trials >= float(self.cfg.curriculum_min_exit_probe_trials))
+            & (local_strong_improvement | (current_local < float(self.cfg.curriculum_quarantine_exit_threshold)))
+        )
+        next_states[quarantine_exit] = self._CURRICULUM_FRONTIER
+        self._curriculum_states.copy_(next_states)
+
+        self._curriculum_window_start_trials[local_valid] = 0.0
+        self._curriculum_window_start_failures[local_valid] = 0.0
+        self._curriculum_window_forward_trials[forward_valid] = 0.0
+        self._curriculum_window_forward_risk_sum[forward_valid] = 0.0
+        if self._curriculum_quality_learning_enabled():
+            self._update_curriculum_quality_statistics()
+            self._refresh_curriculum_quality_learning_pool()
+        self._curriculum_last_state_update_iteration = self._curriculum_iteration
+
     def _curriculum_quality_known_mask(self) -> torch.Tensor:
         """Return MASTERED bins with enough successful, finite quality evidence."""
 
@@ -1444,6 +2299,13 @@ class MotionCommand(CommandTerm):
         """Keep every survival frontier bin and fill the pool with high-error MASTERED bins."""
 
         self._curriculum_quality_filler_mask.zero_()
+        if _cfg_curriculum_learnability_enabled(self.cfg):
+            # Schema 9 uses quality only to reshape MASTERED base coverage;
+            # the legacy fixed-size filler pool must not leak into either the
+            # probability recipe or its diagnostics.
+            self._curriculum_quality_filler_count = 0
+            self._curriculum_quality_error_cutoff = 0.0
+            return
         frontier_count = int(
             (self._curriculum_eligible_bins & (self._curriculum_states == self._CURRICULUM_FRONTIER)).sum().item()
         )
@@ -1498,7 +2360,15 @@ class MotionCommand(CommandTerm):
             if self._curriculum_quality_learning_enabled()
             else ()
         )
-        pending_statistics = (*base_pending_statistics, *quality_pending_statistics)
+        forward_pending_statistics = (
+            (
+                self._current_curriculum_forward_trials,
+                self._current_curriculum_forward_risk_sum,
+            )
+            if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False))
+            else ()
+        )
+        pending_statistics = (*base_pending_statistics, *forward_pending_statistics, *quality_pending_statistics)
         packed = torch.cat(pending_statistics)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
@@ -1517,8 +2387,16 @@ class MotionCommand(CommandTerm):
             total.add_(delta)
         self._curriculum_window_start_trials.add_(base_deltas[0])
         self._curriculum_window_start_failures.add_(base_deltas[1])
+        next_delta = len(base_pending_statistics)
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            forward_trials_delta, forward_risk_delta = deltas[next_delta : next_delta + 2]
+            self.curriculum_forward_trials.add_(forward_trials_delta)
+            self.curriculum_forward_risk_sum.add_(forward_risk_delta)
+            self._curriculum_window_forward_trials.add_(forward_trials_delta)
+            self._curriculum_window_forward_risk_sum.add_(forward_risk_delta)
+            next_delta += 2
         if self._curriculum_quality_learning_enabled():
-            quality_error_delta, quality_trials_delta = deltas[len(base_pending_statistics) :]
+            quality_error_delta, quality_trials_delta = deltas[next_delta:]
             self.curriculum_quality_trials.add_(quality_trials_delta)
             self._curriculum_quality_window_trials.add_(quality_trials_delta)
             self._curriculum_quality_window_error_sum.add_(quality_error_delta)
@@ -1737,9 +2615,13 @@ class MotionCommand(CommandTerm):
             self._current_curriculum_terminal_visits.index_add_(
                 0, entered_bins, torch.ones_like(entered_bins, dtype=torch.float32)
             )
-            self._episode_last_visited_bins[active_env_ids[entered_new_bin]] = entered_bins
+            entered_env_ids = active_env_ids[entered_new_bin]
+            self._episode_last_visited_bins[entered_env_ids] = entered_bins
             self._episode_curriculum_steps[active_env_ids] += 1
-            if self._curriculum_fixed_horizon_enabled():
+            if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+                self._enter_curriculum_forward_bins(entered_env_ids, entered_bins)
+                self._update_curriculum_unified_windows(active_env_ids)
+            elif self._curriculum_fixed_horizon_enabled():
                 horizon_frames = int(self.cfg.curriculum_start_horizon_frames)
                 reached_horizon = (
                     ~self._episode_start_outcome_recorded[active_env_ids]
@@ -1780,6 +2662,42 @@ class MotionCommand(CommandTerm):
 
         self._fixed_motion_ids = None
 
+    def _finalize_curriculum_unified_episodes(
+        self,
+        env_ids: torch.Tensor,
+        terminal_bins: torch.Tensor,
+        episode_failed: torch.Tensor,
+        invalid_state_failed: torch.Tensor,
+        motion_completed: torch.Tensor,
+    ) -> None:
+        """Close V18 local and lookahead windows, with failure taking precedence."""
+
+        if len(env_ids) == 0:
+            return
+        terminal_not_seen = self._episode_last_visited_bins[env_ids] != terminal_bins
+        terminal_env_ids = env_ids[terminal_not_seen]
+        terminal_new_bins = terminal_bins[terminal_not_seen]
+        self._enter_curriculum_forward_bins(terminal_env_ids, terminal_new_bins)
+        self._episode_last_visited_bins[terminal_env_ids] = terminal_new_bins
+
+        valid_failure = episode_failed & ~invalid_state_failed
+        successful_motion_end = motion_completed & ~valid_failure & ~invalid_state_failed
+        interrupted = ~(valid_failure | successful_motion_end)
+
+        self._accumulate_curriculum_terminal_quality(env_ids[successful_motion_end])
+        self._record_curriculum_unified_window_outcomes(
+            env_ids[valid_failure], failed=True, include_terminal_frame=True
+        )
+        self._record_curriculum_unified_window_outcomes(
+            env_ids[successful_motion_end], failed=False, include_terminal_frame=True
+        )
+        self._record_curriculum_unified_window_censored(env_ids[interrupted])
+        self._record_curriculum_forward_outcomes(env_ids[valid_failure], failed=True)
+        self._record_curriculum_forward_outcomes(env_ids[successful_motion_end], failed=False)
+        # Manual reset, invalid state, or an unrelated timeout is censored in
+        # both channels and must not leak pending history into the next motion.
+        self._episode_forward_risk_bins[env_ids[interrupted]] = -1
+
     def _adaptive_sampling(self, env_ids: Sequence[int]):
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         eligibility_enabled = bool(getattr(self.cfg, "curriculum_start_eligibility_enabled", False))
@@ -1813,7 +2731,19 @@ class MotionCommand(CommandTerm):
                     ]
                 except (AttributeError, KeyError, ValueError):
                     invalid_state_failed = torch.zeros_like(episode_failed)
-                if self._curriculum_fixed_horizon_enabled():
+                if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+                    try:
+                        motion_completed = self._env.termination_manager.get_term("motion_time_out")[previous_env_ids]
+                    except (AttributeError, KeyError, ValueError):
+                        motion_completed = torch.zeros_like(episode_failed)
+                    self._finalize_curriculum_unified_episodes(
+                        previous_env_ids,
+                        previous_bins,
+                        episode_failed,
+                        invalid_state_failed,
+                        motion_completed,
+                    )
+                elif self._curriculum_fixed_horizon_enabled():
                     pending_outcome = ~self._episode_start_outcome_recorded[valid_env_ids]
                     within_horizon = self._episode_curriculum_steps[valid_env_ids] <= int(
                         self.cfg.curriculum_start_horizon_frames
@@ -1913,7 +2843,18 @@ class MotionCommand(CommandTerm):
         self.motion_ids[env_ids] = sampled_motion_ids
         self.motion_lengths[env_ids] = self.motion.lengths(sampled_motion_ids)
         bin_lengths = self.bin_ends[sampled_bins] - self.bin_starts[sampled_bins]
-        if self.cfg.start_at_motion_beginning:
+        playback_start_frame = getattr(self.cfg, "playback_start_frame", None)
+        if playback_start_frame is not None:
+            start_frame = int(playback_start_frame)
+            invalid = start_frame >= self.motion_lengths[env_ids]
+            if torch.any(invalid):
+                shortest_length = int(self.motion_lengths[env_ids][invalid].min().item())
+                raise ValueError(
+                    f"Playback start frame {start_frame} is outside the selected motion "
+                    f"(length: {shortest_length} frames; maximum start frame: {shortest_length - 1})."
+                )
+            sampled_time_steps = torch.full((len(env_ids),), start_frame, dtype=torch.long, device=self.device)
+        elif self.cfg.start_at_motion_beginning:
             sampled_time_steps = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
         else:
             if eligibility_enabled:
@@ -1972,7 +2913,9 @@ class MotionCommand(CommandTerm):
             self._episode_last_visited_bins[env_ids] = -1
             self._episode_curriculum_steps[env_ids] = 0
             self._episode_start_outcome_recorded[env_ids] = False
-            if self._curriculum_quality_learning_enabled():
+            if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+                self._initialize_curriculum_unified_episode(env_ids)
+            elif self._curriculum_quality_learning_enabled():
                 self._episode_curriculum_quality_error_sum[env_ids] = 0.0
                 self._episode_curriculum_quality_observation_count[env_ids] = 0.0
                 self._episode_curriculum_quality_valid[env_ids] = self._episode_start_label_enabled[env_ids]
@@ -1997,10 +2940,20 @@ class MotionCommand(CommandTerm):
             # the process group. Preserve the future cross-rank check.
             self._adaptive_layout_checked = self.motion.world_size == 1
             return
+        learnability_enabled = _cfg_curriculum_learnability_enabled(self.cfg)
+        learnability_recipe = self._curriculum_learnability_recipe() if learnability_enabled else (0.0,) * 15
         layout = torch.tensor(
             [
                 self.global_num_motions,
                 self.bin_count,
+                self._curriculum_checkpoint_schema_version()
+                if bool(getattr(self.cfg, "curriculum_sampling_enabled", False))
+                else 0,
+                int(getattr(self.cfg, "curriculum_forward_risk_horizon_bins", 0))
+                if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False))
+                else 0,
+                int(learnability_enabled),
+                *(int(round(value * 1_000_000_000)) for value in learnability_recipe),
                 *self.motion.manifest_fingerprint_words,
             ],
             dtype=torch.long,
@@ -2012,7 +2965,8 @@ class MotionCommand(CommandTerm):
         torch.distributed.all_reduce(layout_max, op=torch.distributed.ReduceOp.MAX)
         if not torch.equal(layout_min, layout_max):
             raise RuntimeError(
-                "Distributed workers disagree on global motion count/bin layout or manifest fingerprint: "
+                "Distributed workers disagree on the global motion/bin layout, curriculum sampler, "
+                "or manifest fingerprint: "
                 f"local={layout.tolist()}, min={layout_min.tolist()}, max={layout_max.tolist()}"
             )
         self._adaptive_layout_checked = True
@@ -2170,7 +3124,7 @@ class MotionCommand(CommandTerm):
                     ),
                 }
             )
-        if schema_version >= self._CURRICULUM_ELIGIBLE_COVERAGE_SCHEMA_VERSION:
+        if self._curriculum_start_eligibility_enabled():
             state.update(
                 {
                     "curriculum_terminal_replay_fraction": torch.tensor(
@@ -2184,7 +3138,7 @@ class MotionCommand(CommandTerm):
                     ),
                 }
             )
-        if schema_version >= self._CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION:
+        if self._curriculum_quality_learning_enabled():
             state.update(
                 {
                     "curriculum_quality_config": torch.tensor(
@@ -2206,6 +3160,36 @@ class MotionCommand(CommandTerm):
                     "curriculum_quality_observed_windows": (self._curriculum_quality_observed_windows.detach().cpu()),
                 }
             )
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            state.update(
+                {
+                    "curriculum_unified_config": torch.tensor(
+                        [
+                            float(self.cfg.curriculum_need_uniform_fraction),
+                            float(self.cfg.curriculum_forward_risk_horizon_bins),
+                            float(self.cfg.curriculum_forward_risk_decay),
+                            float(self.cfg.curriculum_forward_risk_good_threshold),
+                            float(self.cfg.curriculum_forward_risk_bad_threshold),
+                            float(self.cfg.curriculum_quality_good_threshold),
+                            float(self.cfg.curriculum_quality_bad_threshold),
+                            float(self.cfg.curriculum_quarantine_need_scale),
+                        ],
+                        dtype=torch.float32,
+                    ),
+                    "curriculum_forward_trials": self.curriculum_forward_trials.detach().cpu(),
+                    "curriculum_forward_risk_sum": self.curriculum_forward_risk_sum.detach().cpu(),
+                    "curriculum_window_forward_trials": (self._curriculum_window_forward_trials.detach().cpu()),
+                    "curriculum_window_forward_risk_sum": (self._curriculum_window_forward_risk_sum.detach().cpu()),
+                    "curriculum_forward_risk_history": self._curriculum_forward_risk_history.detach().cpu(),
+                    "curriculum_forward_risk_ema": self._curriculum_forward_risk_ema.detach().cpu(),
+                    "curriculum_forward_observed_windows": (self._curriculum_forward_observed_windows.detach().cpu()),
+                }
+            )
+            if _cfg_curriculum_learnability_enabled(self.cfg):
+                state["curriculum_learnability_recipe"] = torch.tensor(
+                    self._curriculum_learnability_recipe(),
+                    dtype=torch.float32,
+                )
         return state
 
     def _reset_curriculum_sampling_state(self) -> None:
@@ -2233,6 +3217,30 @@ class MotionCommand(CommandTerm):
             tensor.zero_()
         self._curriculum_failure_rate_history.fill_(float("nan"))
         self._curriculum_states.fill_(self._CURRICULUM_UNKNOWN)
+        if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+            for tensor in (
+                self.curriculum_forward_trials,
+                self.curriculum_forward_risk_sum,
+                self._current_curriculum_forward_trials,
+                self._current_curriculum_forward_risk_sum,
+                self._curriculum_window_forward_trials,
+                self._curriculum_window_forward_risk_sum,
+                self._curriculum_forward_observed_windows,
+                self._curriculum_last_survival_need,
+                self._curriculum_last_forward_need,
+                self._curriculum_last_quality_need,
+                self._curriculum_last_uncertainty_need,
+                self._curriculum_last_combined_need,
+            ):
+                tensor.zero_()
+            self._curriculum_forward_risk_history.fill_(float("nan"))
+            self._curriculum_forward_risk_ema.fill_(float("nan"))
+            self._episode_unified_window_bins.fill_(-1)
+            self._episode_unified_window_frames.zero_()
+            self._episode_unified_window_steps.zero_()
+            self._episode_unified_window_targets.zero_()
+            self._episode_unified_window_active.zero_()
+            self._episode_forward_risk_bins.fill_(-1)
         if self._curriculum_quality_learning_enabled():
             for tensor in (
                 self.curriculum_quality_trials,
@@ -2248,6 +3256,7 @@ class MotionCommand(CommandTerm):
             self._episode_curriculum_quality_error_sum.zero_()
             self._episode_curriculum_quality_observation_count.zero_()
             self._episode_curriculum_quality_valid.zero_()
+            self._episode_curriculum_quality_last_time_step.fill_(-1)
             self._curriculum_quality_filler_count = 0
             self._curriculum_quality_error_cutoff = 0.0
         self._curriculum_shadow_probabilities.zero_()
@@ -2275,6 +3284,14 @@ class MotionCommand(CommandTerm):
         self._curriculum_has_shadow_state_recipe = False
         self._curriculum_smoothed_probabilities_initialized = False
         self._curriculum_last_probability_smoothing_iteration = -1
+        if _cfg_curriculum_learnability_enabled(self.cfg):
+            self._curriculum_last_learnability_base_fraction = 1.0
+            self._curriculum_last_learnability_primary_support_fraction = 0.0
+            self._curriculum_last_learnability_primary_need_mean = 0.0
+            self._curriculum_last_learnability_primary_scale = 0.0
+            self._curriculum_last_learnability_target_entropy = 1.0
+            self._curriculum_last_learnability_quality_reweighted_fraction = 0.0
+            self._curriculum_last_learnability_quality_mastered_mass = 0.0
         self._curriculum_metric_values = {}
 
     def _curriculum_quality_checkpoint_targets(self) -> dict[str, torch.Tensor]:
@@ -2317,7 +3334,12 @@ class MotionCommand(CommandTerm):
         if not (
             isinstance(saved_quality_config, torch.Tensor)
             and saved_quality_config.shape == runtime_quality_config.shape
-            and torch.allclose(saved_quality_config.cpu().float(), runtime_quality_config, rtol=0.0, atol=1.0e-7)
+            # The learning-pool size and filler weight are sampler recipe.
+            # The remaining fields define how the persisted quality evidence
+            # was measured and accumulated, so only those are evidence-critical.
+            and torch.allclose(
+                saved_quality_config.cpu().float()[2:], runtime_quality_config[2:], rtol=0.0, atol=1.0e-7
+            )
             and all(
                 isinstance(state_dict.get(name), torch.Tensor) and state_dict[name].shape == target.shape
                 for name, target in targets.items()
@@ -2347,6 +3369,28 @@ class MotionCommand(CommandTerm):
                 & torch.all(finite_quality_ema >= 0.0)
                 & torch.all(finite_quality_ema <= 1.0)
             ).item()
+        )
+
+    def _curriculum_quality_checkpoint_recipe_valid(self, state_dict: dict[str, torch.Tensor]) -> bool:
+        """Validate the full quality-learning recipe for an exact resume."""
+
+        saved_config = state_dict.get("curriculum_quality_config")
+        runtime_config = torch.tensor(
+            [
+                float(self.cfg.curriculum_learning_pool_min_fraction),
+                float(self.cfg.curriculum_quality_filler_weight),
+                float(self.cfg.curriculum_quality_min_trials),
+                float(self.cfg.curriculum_quality_min_window_trials),
+                float(self.cfg.curriculum_quality_min_windows),
+                float(self.cfg.curriculum_quality_error_ema_alpha),
+                float(self.cfg.curriculum_quality_body_pos_std),
+            ],
+            dtype=torch.float32,
+        )
+        return bool(
+            isinstance(saved_config, torch.Tensor)
+            and saved_config.shape == runtime_config.shape
+            and torch.allclose(saved_config.cpu().float(), runtime_config, rtol=0.0, atol=1.0e-7)
         )
 
     def _restore_curriculum_quality_checkpoint_state(
@@ -2382,6 +3426,317 @@ class MotionCommand(CommandTerm):
                 "the base curriculum was restored exactly and quality learning restarts cold."
             )
 
+    def _curriculum_unified_checkpoint_targets(self) -> dict[str, torch.Tensor]:
+        """Return schema-7 forward-risk tensors that survive a checkpoint."""
+
+        return {
+            "curriculum_forward_trials": self.curriculum_forward_trials,
+            "curriculum_forward_risk_sum": self.curriculum_forward_risk_sum,
+            "curriculum_window_forward_trials": self._curriculum_window_forward_trials,
+            "curriculum_window_forward_risk_sum": self._curriculum_window_forward_risk_sum,
+            "curriculum_forward_risk_history": self._curriculum_forward_risk_history,
+            "curriculum_forward_risk_ema": self._curriculum_forward_risk_ema,
+            "curriculum_forward_observed_windows": self._curriculum_forward_observed_windows,
+        }
+
+    def _curriculum_learnability_recipe_valid(self, state_dict: dict[str, torch.Tensor]) -> bool:
+        """Validate the schema-9 recipe for an exact resume."""
+
+        saved_config = state_dict.get("curriculum_learnability_recipe")
+        runtime_config = torch.tensor(self._curriculum_learnability_recipe(), dtype=torch.float32)
+        return bool(
+            isinstance(saved_config, torch.Tensor)
+            and saved_config.shape == runtime_config.shape
+            and torch.allclose(saved_config.cpu().float(), runtime_config, rtol=0.0, atol=1.0e-7)
+        )
+
+    def _curriculum_unified_checkpoint_state_valid(self, state_dict: dict[str, torch.Tensor]) -> bool:
+        """Validate evidence-critical V18 config and forward-risk evidence."""
+
+        saved_config = state_dict.get("curriculum_unified_config")
+        runtime_config = torch.tensor(
+            [
+                float(self.cfg.curriculum_need_uniform_fraction),
+                float(self.cfg.curriculum_forward_risk_horizon_bins),
+                float(self.cfg.curriculum_forward_risk_decay),
+                float(self.cfg.curriculum_forward_risk_good_threshold),
+                float(self.cfg.curriculum_forward_risk_bad_threshold),
+                float(self.cfg.curriculum_quality_good_threshold),
+                float(self.cfg.curriculum_quality_bad_threshold),
+                float(self.cfg.curriculum_quarantine_need_scale),
+            ],
+            dtype=torch.float32,
+        )
+        targets = self._curriculum_unified_checkpoint_targets()
+        if not (
+            isinstance(saved_config, torch.Tensor)
+            and saved_config.shape == runtime_config.shape
+            # Forward horizon and decay define the risk observations. Uniform
+            # mass, decision thresholds, and quarantine scaling are recipe and
+            # may change without invalidating the accumulated raw evidence.
+            and torch.allclose(saved_config.cpu().float()[1:3], runtime_config[1:3], rtol=0.0, atol=1.0e-7)
+            and all(
+                isinstance(state_dict.get(name), torch.Tensor) and state_dict[name].shape == target.shape
+                for name, target in targets.items()
+            )
+        ):
+            return False
+        trials = state_dict["curriculum_forward_trials"].float()
+        risk_sum = state_dict["curriculum_forward_risk_sum"].float()
+        window_trials = state_dict["curriculum_window_forward_trials"].float()
+        window_risk_sum = state_dict["curriculum_window_forward_risk_sum"].float()
+        history = state_dict["curriculum_forward_risk_history"].float()
+        risk_ema = state_dict["curriculum_forward_risk_ema"].float()
+        observed = state_dict["curriculum_forward_observed_windows"].float()
+        finite_history = history[torch.isfinite(history)]
+        finite_ema = risk_ema[torch.isfinite(risk_ema)]
+        return bool(
+            (
+                torch.all(torch.isfinite(trials))
+                & torch.all(torch.isfinite(risk_sum))
+                & torch.all(torch.isfinite(window_trials))
+                & torch.all(torch.isfinite(window_risk_sum))
+                & torch.all(~torch.isinf(history))
+                & torch.all(~torch.isinf(risk_ema))
+                & torch.all(trials >= 0.0)
+                & torch.all(risk_sum >= 0.0)
+                & torch.all(risk_sum <= trials + 1.0e-5)
+                & torch.all(window_trials >= 0.0)
+                & torch.all(window_trials <= trials + 1.0e-5)
+                & torch.all(window_risk_sum >= 0.0)
+                & torch.all(window_risk_sum <= window_trials + 1.0e-5)
+                & torch.all(finite_history >= 0.0)
+                & torch.all(finite_history <= 1.0)
+                & torch.all(finite_ema >= 0.0)
+                & torch.all(finite_ema <= 1.0)
+                & torch.all(torch.isfinite(observed))
+                & torch.all(observed >= 0.0)
+                & torch.all(observed <= 255.0)
+            ).item()
+        )
+
+    def _curriculum_unified_checkpoint_recipe_valid(self, state_dict: dict[str, torch.Tensor]) -> bool:
+        """Validate the full unified state/sampler recipe for an exact resume."""
+
+        saved_config = state_dict.get("curriculum_unified_config")
+        runtime_config = torch.tensor(
+            [
+                float(self.cfg.curriculum_need_uniform_fraction),
+                float(self.cfg.curriculum_forward_risk_horizon_bins),
+                float(self.cfg.curriculum_forward_risk_decay),
+                float(self.cfg.curriculum_forward_risk_good_threshold),
+                float(self.cfg.curriculum_forward_risk_bad_threshold),
+                float(self.cfg.curriculum_quality_good_threshold),
+                float(self.cfg.curriculum_quality_bad_threshold),
+                float(self.cfg.curriculum_quarantine_need_scale),
+            ],
+            dtype=torch.float32,
+        )
+        return bool(
+            isinstance(saved_config, torch.Tensor)
+            and saved_config.shape == runtime_config.shape
+            and torch.allclose(saved_config.cpu().float(), runtime_config, rtol=0.0, atol=1.0e-7)
+        )
+
+    def _load_curriculum_unified_checkpoint(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        schema_version: int,
+        *,
+        layout_matches: bool,
+    ) -> bool:
+        """Restore unified schemas or migrate an older recipe behind its frozen sampler."""
+
+        base_targets = {
+            "curriculum_start_trials": self.curriculum_start_trials,
+            "curriculum_start_failures": self.curriculum_start_failures,
+            "curriculum_start_censored": self.curriculum_start_censored,
+            "curriculum_start_survival_steps": self.curriculum_start_survival_steps,
+            "curriculum_start_completion_fraction": self.curriculum_start_completion_fraction,
+            "curriculum_terminal_visits": self.curriculum_terminal_visits,
+            "curriculum_terminal_failures": self.curriculum_terminal_failures,
+            "curriculum_terminal_body_failures": self.curriculum_terminal_body_failures,
+            "curriculum_window_start_trials": self._curriculum_window_start_trials,
+            "curriculum_window_start_failures": self._curriculum_window_start_failures,
+            "curriculum_failure_rate_history": self._curriculum_failure_rate_history,
+            "curriculum_states": self._curriculum_states,
+            "curriculum_state_entry_trials": self._curriculum_state_entry_trials,
+        }
+        fixed_targets = {
+            "curriculum_shadow_probabilities": self._curriculum_shadow_probabilities,
+            "curriculum_smoothed_probabilities": self._curriculum_smoothed_probabilities,
+            "curriculum_shadow_states": self._curriculum_shadow_states,
+        }
+        saved_horizon = state_dict.get("curriculum_start_horizon_frames")
+        horizon_matches = isinstance(saved_horizon, torch.Tensor) and int(saved_horizon.item()) == int(
+            self.cfg.curriculum_start_horizon_frames
+        )
+        base_matches = (
+            layout_matches
+            and horizon_matches
+            and all(
+                isinstance(state_dict.get(name), torch.Tensor) and state_dict[name].shape == target.shape
+                for name, target in base_targets.items()
+            )
+        )
+        saved_states = state_dict.get("curriculum_states")
+        states_valid = isinstance(saved_states, torch.Tensor) and not torch.any(
+            saved_states >= len(self._CURRICULUM_STATE_NAMES)
+        )
+
+        runtime_schema_version = self._curriculum_checkpoint_schema_version()
+        learnability_upgrade = (
+            schema_version
+            in (
+                self._CURRICULUM_UNIFIED_WINDOW_SCHEMA_VERSION,
+                MotionCommand._CURRICULUM_STAGED_SAMPLING_SCHEMA_VERSION,
+            )
+            and runtime_schema_version == MotionCommand._CURRICULUM_LEARNABILITY_SCHEMA_VERSION
+        )
+        same_unified_schema = schema_version == runtime_schema_version and schema_version in (
+            self._CURRICULUM_UNIFIED_WINDOW_SCHEMA_VERSION,
+            MotionCommand._CURRICULUM_LEARNABILITY_SCHEMA_VERSION,
+        )
+        if learnability_upgrade or same_unified_schema:
+            scalar_names = (
+                "curriculum_iteration",
+                "curriculum_last_state_update_iteration",
+                "curriculum_blend_start_iteration",
+                "curriculum_shadow_motion_length_exponent",
+                "curriculum_has_shadow_distribution",
+                "curriculum_has_shadow_state_recipe",
+                "curriculum_smoothed_probabilities_initialized",
+                "curriculum_last_probability_smoothing_iteration",
+            )
+            fixed_matches = all(
+                isinstance(state_dict.get(name), torch.Tensor) and state_dict[name].shape == target.shape
+                for name, target in fixed_targets.items()
+            ) and all(isinstance(state_dict.get(name), torch.Tensor) for name in scalar_names)
+            quality_valid = self._curriculum_quality_checkpoint_state_valid(state_dict, schema_version, schema_version)
+            quality_recipe_valid = MotionCommand._curriculum_quality_checkpoint_recipe_valid(self, state_dict)
+            unified_evidence_valid = self._curriculum_unified_checkpoint_state_valid(state_dict)
+            unified_recipe_valid = MotionCommand._curriculum_unified_checkpoint_recipe_valid(self, state_dict)
+            if schema_version == MotionCommand._CURRICULUM_LEARNABILITY_SCHEMA_VERSION:
+                recipe_valid = MotionCommand._curriculum_learnability_recipe_valid(self, state_dict)
+            else:
+                recipe_valid = quality_recipe_valid and unified_recipe_valid
+            restart_transition = learnability_upgrade or (same_unified_schema and not recipe_valid)
+            saved_sampler = state_dict.get("curriculum_smoothed_probabilities")
+            transition_shadow_valid = not restart_transition or bool(
+                isinstance(saved_sampler, torch.Tensor)
+                and torch.all(torch.isfinite(saved_sampler))
+                and torch.all(saved_sampler >= 0.0)
+                and saved_sampler.sum() > 0.0
+            )
+            evidence_compatible = (
+                base_matches and states_valid and fixed_matches and quality_valid and unified_evidence_valid
+            )
+            if evidence_compatible and transition_shadow_valid:
+                self._reset_curriculum_sampling_state()
+                for name, target in (*base_targets.items(), *fixed_targets.items()):
+                    target.copy_(state_dict[name].to(device=self.device, dtype=target.dtype))
+                for name, target in self._curriculum_unified_checkpoint_targets().items():
+                    target.copy_(state_dict[name].to(device=self.device, dtype=target.dtype))
+                self._restore_curriculum_quality_checkpoint_state(
+                    state_dict,
+                    schema_version,
+                    schema_version,
+                    quality_valid,
+                )
+                if restart_transition:
+                    saved_sampler = state_dict["curriculum_smoothed_probabilities"].to(
+                        device=self.device, dtype=torch.float32
+                    )
+                    self._curriculum_shadow_probabilities.copy_(saved_sampler)
+                    self._curriculum_smoothed_probabilities.copy_(saved_sampler)
+                    self._curriculum_shadow_motion_length_exponent = 1.0
+                    self._curriculum_has_shadow_distribution = True
+                    self._curriculum_has_shadow_state_recipe = False
+                    self._curriculum_smoothed_probabilities_initialized = True
+                    self._curriculum_iteration = 0
+                    self._curriculum_last_state_update_iteration = 0
+                    self._curriculum_blend_start_iteration = -1
+                    self._curriculum_last_probability_smoothing_iteration = 0
+                else:
+                    self._curriculum_iteration = int(state_dict["curriculum_iteration"].item())
+                    self._curriculum_last_state_update_iteration = int(
+                        state_dict["curriculum_last_state_update_iteration"].item()
+                    )
+                    self._curriculum_blend_start_iteration = int(state_dict["curriculum_blend_start_iteration"].item())
+                    self._curriculum_shadow_motion_length_exponent = float(
+                        state_dict["curriculum_shadow_motion_length_exponent"].item()
+                    )
+                    self._curriculum_has_shadow_distribution = bool(
+                        state_dict["curriculum_has_shadow_distribution"].item()
+                    )
+                    self._curriculum_has_shadow_state_recipe = bool(
+                        state_dict["curriculum_has_shadow_state_recipe"].item()
+                    )
+                    self._curriculum_smoothed_probabilities_initialized = bool(
+                        state_dict["curriculum_smoothed_probabilities_initialized"].item()
+                    )
+                    self._curriculum_last_probability_smoothing_iteration = int(
+                        state_dict["curriculum_last_probability_smoothing_iteration"].item()
+                    )
+                self._curriculum_known_fraction = self._curriculum_mask_fraction(self._curriculum_known_mask())
+                self._curriculum_provisional_known_fraction = 1.0
+                self._curriculum_provisional_motion_fraction = 1.0
+                self._refresh_curriculum_quality_learning_pool()
+                if learnability_upgrade:
+                    print(
+                        "[INFO] Migrated unified curriculum evidence into learnability schema 9; "
+                        "the saved sampler remains frozen through the new shadow/blend transition."
+                    )
+                elif not recipe_valid:
+                    print(
+                        "[INFO] Curriculum sampling recipe changed; accumulated evidence was preserved "
+                        "behind the saved sampler for a fresh shadow/blend transition."
+                    )
+                return True
+            print("[WARN] Unified curriculum checkpoint is incompatible; restarting statistics in shadow mode.")
+            self._reset_curriculum_sampling_state()
+            return False
+
+        if schema_version == self._CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION and base_matches and states_valid:
+            quality_valid = self._curriculum_quality_checkpoint_state_valid(
+                state_dict,
+                self._CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION,
+                self._CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION,
+            )
+            shadow_probabilities, _, _, _ = self._checkpoint_curriculum_distribution(state_dict, schema_version)
+            self._reset_curriculum_sampling_state()
+            for name, target in base_targets.items():
+                target.copy_(state_dict[name].to(device=self.device, dtype=target.dtype))
+            if quality_valid:
+                self._restore_curriculum_quality_checkpoint_state(
+                    state_dict,
+                    self._CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION,
+                    self._CURRICULUM_QUALITY_LEARNING_SCHEMA_VERSION,
+                    True,
+                )
+            self._curriculum_shadow_probabilities.copy_(shadow_probabilities)
+            self._curriculum_smoothed_probabilities.copy_(shadow_probabilities)
+            self._curriculum_has_shadow_distribution = True
+            self._curriculum_has_shadow_state_recipe = False
+            self._curriculum_smoothed_probabilities_initialized = True
+            self._curriculum_last_probability_smoothing_iteration = 0
+            self._curriculum_iteration = 0
+            self._curriculum_last_state_update_iteration = 0
+            self._curriculum_blend_start_iteration = -1
+            self._curriculum_known_fraction = self._curriculum_mask_fraction(self._curriculum_known_mask())
+            self._curriculum_provisional_known_fraction = 1.0
+            self._curriculum_provisional_motion_fraction = 1.0
+            self._refresh_curriculum_quality_learning_pool()
+            print(
+                "[INFO] Migrated V17 start and quality evidence into unified V18 windows; "
+                "forward risk starts cold behind the frozen V17 sampler."
+            )
+            return True
+
+        print("[WARN] Curriculum checkpoint cannot migrate to the unified runtime; starting statistics cold.")
+        self._reset_curriculum_sampling_state()
+        return False
+
     def load_adaptive_sampling_state(self, state_dict: dict[str, torch.Tensor]) -> bool:
         episodes = state_dict.get("adp_samp_num_episodes")
         failures = state_dict.get("adp_samp_num_failures")
@@ -2411,6 +3766,17 @@ class MotionCommand(CommandTerm):
                 and isinstance(saved_bin_size, torch.Tensor)
                 and int(saved_bin_size.item()) == int(self.cfg.bin_size)
             )
+            if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+                exact_probability_state_restored = self._load_curriculum_unified_checkpoint(
+                    state_dict,
+                    schema_version,
+                    layout_matches=layout_matches,
+                )
+                self._rebuild_global_sampling_distribution(
+                    advance_curriculum_smoothing=not exact_probability_state_restored
+                )
+                self._rebuild_sampling_distribution()
+                return True
             expected_shapes = {
                 "curriculum_start_trials": self.curriculum_start_trials.shape,
                 "curriculum_start_failures": self.curriculum_start_failures.shape,
@@ -2774,6 +4140,18 @@ class MotionCommand(CommandTerm):
             self._episode_start_outcome_recorded.zero_()
             if self._curriculum_start_eligibility_enabled():
                 self._episode_start_label_enabled.zero_()
+            if bool(getattr(self.cfg, "curriculum_unified_window_enabled", False)):
+                self._episode_unified_window_bins.fill_(-1)
+                self._episode_unified_window_frames.zero_()
+                self._episode_unified_window_steps.zero_()
+                self._episode_unified_window_targets.zero_()
+                self._episode_unified_window_active.zero_()
+                self._episode_forward_risk_bins.fill_(-1)
+            if self._curriculum_quality_learning_enabled():
+                self._episode_curriculum_quality_error_sum.zero_()
+                self._episode_curriculum_quality_observation_count.zero_()
+                self._episode_curriculum_quality_valid.zero_()
+                self._episode_curriculum_quality_last_time_step.fill_(-1)
         del self.motion
         gc.collect()
         self.motion = self._load_motion_collection(selected_global_ids)
@@ -2937,6 +4315,9 @@ class MotionCommandCfg(CommandTermCfg):
     # Playback/debug option. Training keeps random motion-time initialization
     # unless this is explicitly enabled by a caller such as play.py.
     start_at_motion_beginning: bool = False
+    # Explicit playback-only start frame. None preserves the configured sampler;
+    # an integer overrides start_at_motion_beginning and random/bin sampling.
+    playback_start_frame: int | None = None
 
     bin_size: int = 50
     sequence_length_agnostic: bool = True
@@ -3009,6 +4390,23 @@ class MotionCommandCfg(CommandTermCfg):
     curriculum_quality_min_windows: int = 2
     curriculum_quality_error_ema_alpha: float = 0.5
     curriculum_quality_body_pos_std: float = 0.3
+    # V18 assigns the same local survival and quality meaning to the initial
+    # rollout window and every naturally reached non-overlapping window.
+    curriculum_unified_window_enabled: bool = False
+    # V18 samples 20% from all valid frames and 80% from the maximum normalized
+    # survival, forward-risk, quality, or uncertainty need of each bin.
+    curriculum_need_uniform_fraction: float = 0.20
+    # V18 uses "need". V19 uses "learnability": difficult bins receive extra
+    # priority only while uncertainty or recent improvement says they can still
+    # learn; tracking quality only reshapes MASTERED's existing base coverage.
+    curriculum_sampling_strategy: str = "need"
+    curriculum_forward_risk_horizon_bins: int = 5
+    curriculum_forward_risk_decay: float = 0.80
+    curriculum_forward_risk_good_threshold: float = 0.05
+    curriculum_forward_risk_bad_threshold: float = 0.60
+    curriculum_quality_good_threshold: float = 0.08
+    curriculum_quality_bad_threshold: float = 0.30
+    curriculum_quarantine_need_scale: float = 0.25
     # Alpha=1 is v14's equal-bin distribution.  Alpha=0 chooses motions
     # equally within each state; intermediate values temper length exposure.
     curriculum_motion_length_exponent: float = 1.0

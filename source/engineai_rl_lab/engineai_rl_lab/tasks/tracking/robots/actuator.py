@@ -59,6 +59,16 @@ class DelayedImplicitActuator(ImplicitActuator):
         self.velocities_delay_buffer.reset(env_ids)
         self.efforts_delay_buffer.reset(env_ids)
 
+    def seed_position_history(self, joint_pos: torch.Tensor, env_ids: Sequence[int] | torch.Tensor | None) -> None:
+        """Initialize reset environments' delayed position history from their reset pose.
+
+        This seed is one logical sample immediately before the next policy
+        command.  It therefore preserves the configured lag while avoiding the
+        empty-buffer behavior that would otherwise backfill the first policy
+        target and apply it with zero delay.
+        """
+        self.positions_delay_buffer.seed(joint_pos, env_ids)
+
     def compute(
         self, control_action: ArticulationActions, joint_pos: torch.Tensor, joint_vel: torch.Tensor
     ) -> ArticulationActions:
@@ -81,3 +91,27 @@ class DelayedImplicitActuatorCfg(ImplicitActuatorCfg):
 
     max_delay: int = 0
     """Maximum number of physics time-steps with which the actuator command may be delayed. Defaults to 0."""
+
+
+class FixedPositionImplicitActuator(ImplicitActuator):
+    """Implicit PD actuator that ignores commands and holds a fixed joint position."""
+
+    cfg: FixedPositionImplicitActuatorCfg
+
+    def compute(
+        self, control_action: ArticulationActions, joint_pos: torch.Tensor, joint_vel: torch.Tensor
+    ) -> ArticulationActions:
+        control_action.joint_positions = torch.full_like(joint_pos, self.cfg.fixed_position)
+        control_action.joint_velocities = torch.zeros_like(joint_vel)
+        control_action.joint_efforts = torch.zeros_like(joint_pos)
+        return super().compute(control_action, joint_pos, joint_vel)
+
+
+@configclass
+class FixedPositionImplicitActuatorCfg(ImplicitActuatorCfg):
+    """Configuration for an implicit PD actuator with a constant position target."""
+
+    class_type: type = FixedPositionImplicitActuator
+
+    fixed_position: float = 0.0
+    """Position target applied to every joint in the actuator group [rad]."""

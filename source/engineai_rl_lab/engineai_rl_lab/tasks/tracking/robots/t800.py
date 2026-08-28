@@ -1,7 +1,11 @@
+from copy import deepcopy
 from importlib.util import find_spec
 from pathlib import Path
 
-from engineai_rl_lab.tasks.tracking.robots.actuator import DelayedImplicitActuatorCfg
+from engineai_rl_lab.tasks.tracking.robots.actuator import (
+    DelayedImplicitActuatorCfg,
+    FixedPositionImplicitActuatorCfg,
+)
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import apply_articulation_ordering_preset
@@ -270,6 +274,23 @@ T800_CYLINDER_CFG = RobotArticulationCfg(
 )
 T800_CYLINDER_CFG = apply_articulation_ordering_preset(T800_CYLINDER_CFG, "physx")
 
+# V21 robot variant: the policy does not command the head, and these actuators hold it at zero.
+# Keep this separate from T800_CYLINDER_CFG so earlier task versions retain 25-DoF control.
+T800_FIXED_HEAD_CFG = deepcopy(T800_CYLINDER_CFG)
+T800_FIXED_HEAD_CFG.actuators["heads_and_elbow_yaw"].joint_names_expr = [
+    "J17_ELBOW_YAW_L",
+    "J22_ELBOW_YAW_R",
+]
+T800_FIXED_HEAD_CFG.actuators["fixed_head"] = FixedPositionImplicitActuatorCfg(
+    joint_names_expr=["J23_HEAD_PITCH", "J24_HEAD_YAW"],
+    effort_limit_sim=EFFORT_LIMIT_Q25H,
+    velocity_limit_sim=VELOCITY_LIMIT_Q25H,
+    stiffness=50.0,
+    damping=0.3,
+    armature=ARMATURE_Q25H,
+    fixed_position=0.0,
+)
+
 T800_ACTION_SCALE: dict[str, float] = {
     "J00_HIP_PITCH_L": 0.5,
     "J01_HIP_ROLL_L": 0.2,
@@ -296,4 +317,15 @@ T800_ACTION_SCALE: dict[str, float] = {
     "J22_ELBOW_YAW_R": 0.05,
     "J23_HEAD_PITCH": 0.2,
     "J24_HEAD_YAW": 0.2,
+}
+
+T800_HEAD_JOINT_POSITIONS: dict[str, float] = {
+    "J23_HEAD_PITCH": DEFAULT_Q_HEAD_PITCH,
+    "J24_HEAD_YAW": DEFAULT_Q_HEAD_YAW,
+}
+T800_POLICY_JOINT_NAMES: list[str] = [
+    name for name in T800_ACTION_SCALE if name not in T800_HEAD_JOINT_POSITIONS
+]
+T800_POLICY_ACTION_SCALE: dict[str, float] = {
+    name: T800_ACTION_SCALE[name] for name in T800_POLICY_JOINT_NAMES
 }

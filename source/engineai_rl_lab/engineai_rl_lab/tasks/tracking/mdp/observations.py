@@ -224,16 +224,79 @@ def motion_body_pose_b_window_by_entity(
 
 
 def motion_body_pose_b_window_by_entity_xz(
-    env: ManagerBasedEnv, command_name: str, frame_offsets: list[int] | tuple[int, ...]
+    env: ManagerBasedEnv,
+    command_name: str,
+    frame_offsets: list[int] | tuple[int, ...],
+    zero_invalid_offsets: bool = False,
 ) -> torch.Tensor:
     """Reference body poses using the X/Z 6D rotation encoding from V9.
 
     This is exactly the target-trajectory half of
     :func:`motion_body_pose_and_error_b_window_by_entity`, without the
-    target-to-current error features.
+    target-to-current error features. Offsets outside the motion clip can be
+    zeroed instead of endpoint-clamped to preserve BeyondMinic validity.
     """
-    _, _, _, _, pos_b, ori_b = _motion_body_pose_b_window_components(env, command_name, frame_offsets)
-    return _pose_by_entity_xz(pos_b, ori_b)
+    command, num_frames, num_bodies, _, pos_b, ori_b = _motion_body_pose_b_window_components(
+        env, command_name, frame_offsets
+    )
+    target_pose = _pose_by_entity_xz(pos_b, ori_b)
+    if zero_invalid_offsets:
+        _, validity = _motion_time_steps_and_validity(command, frame_offsets)
+        validity = validity[:, None, :, None].to(dtype=target_pose.dtype)
+        target_pose = target_pose.reshape(env.num_envs, num_bodies, num_frames, 9)
+        target_pose = (target_pose * validity).reshape(env.num_envs, num_bodies, num_frames * 9)
+    return target_pose
+
+
+def motion_body_pose_reference_anchor_window_by_entity_xz(
+    env: ManagerBasedEnv,
+    command_name: str,
+    frame_offsets: list[int] | tuple[int, ...],
+    zero_invalid_offsets: bool = False,
+) -> torch.Tensor:
+    """Reference poses translated from the current reference anchor.
+
+    This matches ScaleBFM's local-tracking position convention: target body
+    positions at every requested frame are translated by the reference
+    anchor position at the current frame, while both positions and
+    orientations are expressed along the robot's current anchor axes.  The
+    current reference anchor therefore has zero position without requiring a
+    world-frame estimate of the robot anchor position.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    time_steps = _motion_time_steps(command, frame_offsets)
+    body_pos_w, body_quat_w = command.sample_body_window(time_steps)
+    body_pos_w = body_pos_w + env.scene.env_origins[:, None, None, :]
+    num_frames, num_bodies = time_steps.shape[1], len(command.cfg.body_names)
+    pos_b, ori_b = subtract_frame_transforms(
+        command.anchor_pos_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        command.robot_anchor_quat_w[:, None, None, :].expand(-1, num_frames, num_bodies, -1),
+        body_pos_w,
+        body_quat_w,
+    )
+    target_pose = _pose_by_entity_xz(pos_b, ori_b)
+    if zero_invalid_offsets:
+        _, validity = _motion_time_steps_and_validity(command, frame_offsets)
+        validity = validity[:, None, :, None].to(dtype=target_pose.dtype)
+        target_pose = target_pose.reshape(env.num_envs, num_bodies, num_frames, 9)
+        target_pose = (target_pose * validity).reshape(env.num_envs, num_bodies, num_frames * 9)
+    return target_pose
+
+
+def motion_body_pose_reference_anchor_window_xz_flat(
+    env: ManagerBasedEnv,
+    command_name: str,
+    frame_offsets: list[int] | tuple[int, ...],
+    zero_invalid_offsets: bool = False,
+) -> torch.Tensor:
+    """Flatten ScaleBFM-local body-pose tokens for a concatenated MLP observation group."""
+    command = motion_body_pose_reference_anchor_window_by_entity_xz(
+        env,
+        command_name,
+        frame_offsets,
+        zero_invalid_offsets=zero_invalid_offsets,
+    )
+    return command.flatten(start_dim=1)
 
 
 def motion_body_pose_b_window_xz_flat(
@@ -309,6 +372,47 @@ def motion_body_pose_and_error_b_window_flat(
         env, command_name, frame_offsets, zero_invalid_offsets=zero_invalid_offsets
     )
     return command.flatten(start_dim=1)
+
+
+def _motion_joint_target_and_error(
+    env: ManagerBasedEnv,
+    command_name: str,
+    joint_names: list[str] | None,
+    *,
+    velocity: bool,
+) -> torch.Tensor:
+    """Pack selected reference joint state and reference-minus-robot error."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if joint_names is None:
+        joint_indexes = list(range(command.robot.num_joints))
+    else:
+        joint_indexes = [command.robot.joint_names.index(name) for name in joint_names]
+
+    if velocity:
+        target = command.joint_vel[:, joint_indexes]
+        current = command.robot_joint_vel[:, joint_indexes]
+    else:
+        target = command.joint_pos[:, joint_indexes]
+        current = command.robot_joint_pos[:, joint_indexes]
+    return torch.cat((target, target - current), dim=-1)
+
+
+def motion_joint_position_target_and_error(
+    env: ManagerBasedEnv,
+    command_name: str,
+    joint_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Return selected reference joint positions and their tracking errors."""
+    return _motion_joint_target_and_error(env, command_name, joint_names, velocity=False)
+
+
+def motion_joint_velocity_target_and_error(
+    env: ManagerBasedEnv,
+    command_name: str,
+    joint_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Return selected reference joint velocities and their tracking errors."""
+    return _motion_joint_target_and_error(env, command_name, joint_names, velocity=True)
 
 
 def motion_anchor_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

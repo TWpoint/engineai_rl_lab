@@ -160,6 +160,23 @@ def test_v11_command_is_exactly_v9_target_half() -> None:
     torch.testing.assert_close(target_only, target_and_error[..., :27])
 
 
+def test_target_only_command_preserves_beyondminic_invalid_offset_mask() -> None:
+    env, _ = _fake_env()
+    frame_offsets = [-2, 0, 2]
+
+    target_only = motion_body_pose_b_window_by_entity_xz(env, "motion", frame_offsets, zero_invalid_offsets=True)
+    target_and_error = motion_body_pose_and_error_b_window_by_entity(
+        env, "motion", frame_offsets, zero_invalid_offsets=True
+    )
+
+    assert target_only.shape == (1, 2, 27)
+    torch.testing.assert_close(target_only, target_and_error[..., :27])
+    target_frames = target_only.reshape(1, 2, 3, 9)
+    assert torch.count_nonzero(target_frames[:, :, 0]) == 0
+    assert torch.count_nonzero(target_frames[:, :, 1]) > 0
+    assert torch.count_nonzero(target_frames[:, :, 2]) == 0
+
+
 def test_v9_scale_config_uses_asymmetric_window_and_stronger_action_rate_penalty() -> None:
     v8_env_cfg = T800FlatWoStateEstimationEnvCfgV8Scale()
     env_cfg = T800FlatWoStateEstimationEnvCfgV9Scale()
