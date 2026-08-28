@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import math
 import os
 import re
+import socket
+import stat
+import tempfile
+import time
+import uuid
 import zipfile
 from collections import deque
 from collections.abc import Iterator, Sequence
@@ -16,6 +23,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
+
+_MOTION_CATALOG_SCHEMA_VERSION = 1
+_MOTION_CATALOG_LOCK_POLL_SECONDS = 0.1
+_MOTION_CATALOG_LOCK_WAIT_SECONDS = 30.0 * 60.0
+_MOTION_CATALOG_LOCK_STALE_SECONDS = 6.0 * 60.0 * 60.0
 
 MOTION_FIELDS = (
     "joint_pos",
@@ -31,16 +43,19 @@ MOTION_FIELD_GROUPS = {
 }
 
 
-def resolve_motion_files(manifest: str | os.PathLike[str]) -> list[str]:
-    """Resolve one NPZ or a recursive ``files``/``exclude_files`` YAML manifest."""
+def _resolve_motion_files_and_dependencies(
+    manifest: str | os.PathLike[str],
+) -> tuple[list[str], dict[str, str]]:
+    """Resolve a motion source and fingerprint each YAML document that was parsed."""
 
     root = Path(manifest).expanduser().resolve()
     if root.suffix.lower() not in {".yaml", ".yml"}:
         if not root.is_file():
             raise FileNotFoundError(f"Motion file does not exist: {root}")
-        return [str(root)]
+        return [str(root)], {}
 
     visiting: set[Path] = set()
+    dependency_digests: dict[str, str] = {}
 
     def _walk(path: Path) -> tuple[list[Path], list[str]]:
         path = path.resolve()
@@ -49,9 +64,10 @@ def resolve_motion_files(manifest: str | os.PathLike[str]) -> list[str]:
         if not path.is_file():
             raise FileNotFoundError(f"Motion manifest does not exist: {path}")
         visiting.add(path)
-        with path.open(encoding="utf-8") as stream:
-            safe_loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
-            document = yaml.load(stream, Loader=safe_loader) or {}
+        raw_document = path.read_bytes()
+        dependency_digests[str(path)] = hashlib.sha256(raw_document).hexdigest()
+        safe_loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+        document = yaml.load(raw_document.decode("utf-8"), Loader=safe_loader) or {}
         if not isinstance(document, dict):
             raise ValueError(f"Motion manifest {path} must contain a mapping")
 
@@ -119,7 +135,14 @@ def resolve_motion_files(manifest: str | os.PathLike[str]) -> list[str]:
         unique.append(str(motion))
     if not unique:
         raise ValueError(f"Motion manifest {root} did not resolve to any .npz files")
-    return unique
+    return unique, dependency_digests
+
+
+def resolve_motion_files(manifest: str | os.PathLike[str]) -> list[str]:
+    """Resolve one NPZ or a recursive ``files``/``exclude_files`` YAML manifest."""
+
+    motion_files, _ = _resolve_motion_files_and_dependencies(manifest)
+    return motion_files
 
 
 def shard_motion_files(motion_files: Sequence[str], *, world_size: int, rank: int) -> tuple[list[str], list[int]]:
@@ -170,6 +193,370 @@ def read_motion_lengths(motion_files: Sequence[str], *, max_workers: int = 4) ->
         return [read_motion_length(path) for path in motion_files]
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="motion-header") as executor:
         return list(executor.map(read_motion_length, motion_files))
+
+
+def _catalog_digest(motion_files: Sequence[str], motion_lengths: Sequence[int]) -> str:
+    digest = hashlib.sha256()
+    for path, length in zip(motion_files, motion_lengths, strict=True):
+        encoded_path = os.fsencode(path)
+        digest.update(len(encoded_path).to_bytes(8, byteorder="little"))
+        digest.update(encoded_path)
+        digest.update(int(length).to_bytes(8, byteorder="little", signed=False))
+    return digest.hexdigest()
+
+
+def _direct_motion_signature(path: Path) -> dict[str, str | int]:
+    file_stat = path.stat()
+    return {
+        "path": str(path),
+        "size": int(file_stat.st_size),
+        "mtime_ns": int(file_stat.st_mtime_ns),
+    }
+
+
+def _catalog_payload(
+    manifest: Path,
+    motion_files: list[str],
+    motion_lengths: list[int],
+    dependency_digests: dict[str, str],
+) -> dict[str, object]:
+    is_yaml = manifest.suffix.lower() in {".yaml", ".yml"}
+    return {
+        "schema_version": _MOTION_CATALOG_SCHEMA_VERSION,
+        "manifest": str(manifest),
+        "manifest_dependencies": [{"path": path, "sha256": digest} for path, digest in dependency_digests.items()],
+        "direct_motion": None if is_yaml else _direct_motion_signature(manifest),
+        "motion_files": motion_files,
+        "motion_lengths": motion_lengths,
+        "catalog_sha256": _catalog_digest(motion_files, motion_lengths),
+    }
+
+
+def _valid_manifest_dependencies(payload: dict[str, object], manifest: Path) -> bool:
+    dependencies = payload.get("manifest_dependencies")
+    if not isinstance(dependencies, list) or not dependencies:
+        return False
+    dependency_paths: set[str] = set()
+    for dependency in dependencies:
+        if not isinstance(dependency, dict):
+            return False
+        path = dependency.get("path")
+        expected_digest = dependency.get("sha256")
+        if (
+            not isinstance(path, str)
+            or path in dependency_paths
+            or not Path(path).is_absolute()
+            or Path(path).suffix.lower() not in {".yaml", ".yml"}
+            or not isinstance(expected_digest, str)
+            or len(expected_digest) != 64
+        ):
+            return False
+        dependency_paths.add(path)
+        try:
+            actual_digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:
+            return False
+        if actual_digest != expected_digest:
+            return False
+    return str(manifest) in dependency_paths
+
+
+def _valid_direct_motion(payload: dict[str, object], manifest: Path) -> bool:
+    direct_motion = payload.get("direct_motion")
+    if not isinstance(direct_motion, dict) or direct_motion.get("path") != str(manifest):
+        return False
+    expected_size = direct_motion.get("size")
+    expected_mtime_ns = direct_motion.get("mtime_ns")
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size < 0
+        or not isinstance(expected_mtime_ns, int)
+        or isinstance(expected_mtime_ns, bool)
+    ):
+        return False
+    try:
+        actual = manifest.stat()
+    except OSError:
+        return False
+    return actual.st_size == expected_size and actual.st_mtime_ns == expected_mtime_ns
+
+
+def _validated_catalog_payload(
+    payload: object,
+    manifest: Path,
+) -> tuple[list[str], list[int]] | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != _MOTION_CATALOG_SCHEMA_VERSION:
+        return None
+    if payload.get("manifest") != str(manifest):
+        return None
+
+    motion_files = payload.get("motion_files")
+    motion_lengths = payload.get("motion_lengths")
+    if (
+        not isinstance(motion_files, list)
+        or not motion_files
+        or not isinstance(motion_lengths, list)
+        or len(motion_files) != len(motion_lengths)
+    ):
+        return None
+    if any(
+        not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix.lower() != ".npz"
+        for path in motion_files
+    ):
+        return None
+    if len(set(motion_files)) != len(motion_files):
+        return None
+    if any(not isinstance(length, int) or isinstance(length, bool) or length < 2 for length in motion_lengths):
+        return None
+    expected_digest = payload.get("catalog_sha256")
+    if not isinstance(expected_digest, str) or _catalog_digest(motion_files, motion_lengths) != expected_digest:
+        return None
+
+    if manifest.suffix.lower() in {".yaml", ".yml"}:
+        if payload.get("direct_motion") is not None or not _valid_manifest_dependencies(payload, manifest):
+            return None
+    elif payload.get("manifest_dependencies") != [] or not _valid_direct_motion(payload, manifest):
+        return None
+    return motion_files, motion_lengths
+
+
+def _load_motion_catalog_cache(cache_path: Path, manifest: Path) -> tuple[list[str], list[int]] | None:
+    try:
+        with cache_path.open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return _validated_catalog_payload(payload, manifest)
+
+
+def _cache_file_identity(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        file_stat = path.stat()
+    except OSError:
+        return None
+    return (file_stat.st_dev, file_stat.st_ino, file_stat.st_size, file_stat.st_mtime_ns)
+
+
+def _try_create_catalog_lock(lock_path: Path) -> tuple[str | None, bool]:
+    token = uuid.uuid4().hex
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        descriptor = os.open(lock_path, flags, 0o644)
+    except FileExistsError:
+        return None, True
+    except OSError:
+        return None, False
+    try:
+        owner = {
+            "token": token,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "created_ns": time.time_ns(),
+        }
+        with os.fdopen(descriptor, mode="w", encoding="utf-8") as stream:
+            json.dump(owner, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
+        raise
+    return token, True
+
+
+def _catalog_lock_is_stale(lock_path: Path) -> bool:
+    try:
+        lock_stat = lock_path.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(lock_stat.st_mode):
+        return False
+    if time.time() - lock_stat.st_mtime > _MOTION_CATALOG_LOCK_STALE_SECONDS:
+        return True
+    try:
+        with lock_path.open(encoding="utf-8") as stream:
+            owner = json.load(stream)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(owner, dict) or owner.get("hostname") != socket.gethostname():
+        return False
+    pid = owner.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, PermissionError):
+        return False
+    return False
+
+
+def _remove_stale_catalog_lock(lock_path: Path) -> None:
+    try:
+        observed = lock_path.stat()
+    except OSError:
+        return
+    if not _catalog_lock_is_stale(lock_path):
+        return
+    try:
+        current = lock_path.stat()
+    except OSError:
+        return
+    if (current.st_dev, current.st_ino, current.st_mtime_ns) != (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mtime_ns,
+    ):
+        return
+    with contextlib.suppress(OSError):
+        lock_path.unlink()
+
+
+def _release_catalog_lock(lock_path: Path, token: str) -> None:
+    try:
+        with lock_path.open(encoding="utf-8") as stream:
+            owner = json.load(stream)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if not isinstance(owner, dict) or owner.get("token") != token:
+        return
+    with contextlib.suppress(OSError):
+        lock_path.unlink()
+
+
+def _atomic_write_catalog(cache_path: Path, payload: dict[str, object]) -> bool:
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=cache_path.parent,
+            prefix=f".{cache_path.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, mode="w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, cache_path)
+        temporary_path = None
+        try:
+            directory_descriptor = os.open(cache_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError:
+            pass
+        else:
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    finally:
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                temporary_path.unlink()
+
+
+def _build_motion_catalog(
+    manifest: Path,
+    *,
+    max_workers: int,
+) -> tuple[list[str], list[int], dict[str, object]]:
+    motion_files, dependency_digests = _resolve_motion_files_and_dependencies(manifest)
+    motion_lengths = read_motion_lengths(motion_files, max_workers=max_workers)
+    payload = _catalog_payload(manifest, motion_files, motion_lengths, dependency_digests)
+    return motion_files, motion_lengths, payload
+
+
+def resolve_motion_catalog(
+    manifest: str | os.PathLike[str],
+    *,
+    cache_path: str | os.PathLike[str] | None = None,
+    max_workers: int = 4,
+) -> tuple[list[str], list[int]]:
+    """Resolve ordered motion paths and frame lengths, optionally through a safe JSON cache.
+
+    A cache hit re-hashes only the recursive YAML documents, not every referenced
+    NPZ. YAML motion corpora are therefore treated as immutable/versioned: change
+    a manifest (or delete the sidecar) when replacing NPZ data in place. The
+    subsequent ``MotionCollection`` decode still checks the length of every NPZ
+    it actually loads against this catalog.
+
+    The cache is opt-in. Writers coordinate with an ``O_EXCL`` lock file, which
+    works on the shared NFS deployment where advisory locks are disabled, and
+    publish with an atomic replace. A corrupt, stale, or unwritable cache falls
+    back to rebuilding the catalog without changing motion-loading semantics.
+    """
+
+    if max_workers <= 0:
+        raise ValueError("max_workers must be positive")
+    resolved_manifest = Path(manifest).expanduser().resolve()
+    if cache_path is None:
+        motion_files, _ = _resolve_motion_files_and_dependencies(resolved_manifest)
+        return motion_files, read_motion_lengths(motion_files, max_workers=max_workers)
+
+    resolved_cache_path = Path(os.path.abspath(os.path.expanduser(os.fspath(cache_path))))
+    if resolved_cache_path == resolved_manifest:
+        raise ValueError("cache_path must not overwrite the motion manifest")
+    cached = _load_motion_catalog_cache(resolved_cache_path, resolved_manifest)
+    if cached is not None:
+        return cached
+
+    try:
+        resolved_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        motion_files, _ = _resolve_motion_files_and_dependencies(resolved_manifest)
+        return motion_files, read_motion_lengths(motion_files, max_workers=max_workers)
+
+    lock_path = resolved_cache_path.with_name(f"{resolved_cache_path.name}.lock")
+    initial_cache_identity = _cache_file_identity(resolved_cache_path)
+    deadline = time.monotonic() + _MOTION_CATALOG_LOCK_WAIT_SECONDS
+    token: str | None = None
+    while token is None:
+        token, lock_available = _try_create_catalog_lock(lock_path)
+        if token is not None:
+            break
+        if not lock_available:
+            motion_files, _ = _resolve_motion_files_and_dependencies(resolved_manifest)
+            return motion_files, read_motion_lengths(motion_files, max_workers=max_workers)
+        if _catalog_lock_is_stale(lock_path):
+            _remove_stale_catalog_lock(lock_path)
+            continue
+        current_cache_identity = _cache_file_identity(resolved_cache_path)
+        if current_cache_identity != initial_cache_identity:
+            cached = _load_motion_catalog_cache(resolved_cache_path, resolved_manifest)
+            if cached is not None:
+                return cached
+            initial_cache_identity = current_cache_identity
+        if time.monotonic() >= deadline:
+            motion_files, _ = _resolve_motion_files_and_dependencies(resolved_manifest)
+            return motion_files, read_motion_lengths(motion_files, max_workers=max_workers)
+        time.sleep(_MOTION_CATALOG_LOCK_POLL_SECONDS)
+
+    try:
+        cached = _load_motion_catalog_cache(resolved_cache_path, resolved_manifest)
+        if cached is not None:
+            return cached
+        motion_files, motion_lengths, payload = _build_motion_catalog(
+            resolved_manifest,
+            max_workers=max_workers,
+        )
+        # Do not publish a catalog from a YAML snapshot that changed while the
+        # (potentially long) NPZ header scan was in progress.
+        if resolved_manifest.suffix.lower() not in {".yaml", ".yml"} or _valid_manifest_dependencies(
+            payload, resolved_manifest
+        ):
+            _atomic_write_catalog(resolved_cache_path, payload)
+        return motion_files, motion_lengths
+    finally:
+        _release_catalog_lock(lock_path, token)
 
 
 @dataclass(frozen=True)

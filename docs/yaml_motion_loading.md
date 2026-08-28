@@ -2,8 +2,9 @@
 
 The tracking tasks keep `commands.motion.motion_file` as their only dataset
 interface. It may point to one NPZ file or to the existing recursive YAML
-manifest. Training does not require a converted dataset, generated catalog, or
-project-specific on-disk format.
+manifest. An optional JSON catalog caches the resolved paths and frame counts;
+the original YAML and NPZ files remain the source of truth and no converted
+motion format is required.
 
 ## Distributed layout
 
@@ -35,19 +36,34 @@ the pose group, while the per-step command cache reads both groups.
 The chunks are an internal, process-local memory layout. They are never written
 to disk and do not alter the YAML or NPZ contract.
 
+## Persistent catalog
+
+`motion_catalog_cache` avoids reopening every NPZ merely to discover its frame
+count. A cache hit validates the complete recursive YAML dependency graph and
+the ordered path/length digest, but deliberately does not `stat` every NPZ. The
+referenced NPZ corpus is therefore treated as immutable/versioned: modify a
+manifest or delete the catalog when replacing an NPZ in place.
+
+Concurrent writers use an atomic exclusive-create lock file and publish through
+`fsync` plus `os.replace`; this also works on the cluster's NFS mounts where
+advisory locking is disabled. The V23 launcher warms this shared catalog before
+starting `torchrun`, so the first scan is performed once instead of by 24 ranks.
+
 ## Adaptive sampling
 
-Adaptive statistics are rank-local when motion files are rank-sharded because
-different ranks intentionally own different bin tables. Gradients remain
-globally reduced by DDP. A cached inverse CDF makes reset-time sampling
-`O(batch * log(bins))`; the distribution is rebuilt only when accumulated
-statistics are merged. If a rank would exceed the configured bin limit, the
-sampler falls back from fixed-size temporal bins to one bucket per local motion.
+The legacy command keeps rank-local adaptive tables when files are sharded.
+`MotionCommandV1` instead keeps the complete global bin layout on every rank and
+all-reduces its sufficient statistics. Each rank then conditions that global
+distribution on its resident shard. This preserves global IDs, checkpoint
+layout, and corpus-wide evidence, while deliberately giving every rank equal
+training capacity even if adaptive probability mass becomes uneven across
+shards.
 
 ## Relevant configuration
 
 ```python
 commands.motion.motion_file = "/path/to/t800_v0.yaml"
+commands.motion.motion_catalog_cache = "/path/to/t800_v0.motion_catalog.json"
 commands.motion.motion_shard_across_ranks = True
 commands.motion.motion_load_workers = 4
 commands.motion.motion_chunk_frames = 8_388_608
@@ -68,6 +84,12 @@ ratio). A rank-0 CPU validation using the 14 V8 command bodies measured:
 - 12.4 seconds after resolution to inspect, validate, decode, and pack 4,730
   original NPZ files;
 - 0.29 ms for an 8,192-row all-field CPU `sample_many` call.
+
+The V23 24-rank configuration was also validated on the same corpus: the first
+catalog build took 52.3 seconds, a catalog hit took 6.4 seconds including Python
+startup and dependency validation, and rank 0 decoded its 6,306 files / 2.846M
+frames into 2.46 GiB in 20.1 seconds. The 24 shards are disjoint, contain 6,305
+or 6,306 files each, and sum to all 68,985,003 frames.
 
 Storage remains linear in selected frames: 232 float32 values, or 928 bytes,
 per frame for the current 25 joints and 14 bodies. At 100 times this corpus,

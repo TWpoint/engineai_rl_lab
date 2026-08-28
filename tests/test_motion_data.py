@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import multiprocessing
+import socket
 import sys
 from pathlib import Path
 
@@ -26,6 +29,7 @@ SPEC.loader.exec_module(motion_data)
 
 MotionCollection = motion_data.MotionCollection
 MotionLoader = motion_data.MotionLoader
+resolve_motion_catalog = motion_data.resolve_motion_catalog
 resolve_motion_files = motion_data.resolve_motion_files
 select_motion_shard = motion_data.select_motion_shard
 shard_motion_files = motion_data.shard_motion_files
@@ -59,6 +63,20 @@ def _write_motion(path: Path, frames: int, offset: float, *, quaternion_order: s
         body_lin_vel_w=body_base + 1000.0,
         body_ang_vel_w=body_base + 2000.0,
     )
+
+
+def _resolve_catalog_process(
+    manifest: str,
+    cache_path: str,
+    start_event,
+    results,
+) -> None:
+    start_event.wait()
+    try:
+        results.put(resolve_motion_catalog(manifest, cache_path=cache_path, max_workers=1))
+    except BaseException as error:  # pragma: no cover - asserted through the child exit/result.
+        results.put((type(error).__name__, str(error)))
+        raise
 
 
 def test_recursive_yaml_resolver_preserves_order_deduplicates_and_excludes(tmp_path: Path) -> None:
@@ -104,6 +122,167 @@ def test_yaml_resolver_applies_glob_exclusions(tmp_path: Path) -> None:
     )
 
     assert resolve_motion_files(root) == [str(motions / "keep.npz")]
+
+
+def test_motion_catalog_cache_hit_skips_manifest_resolution_and_npz_headers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    motions = tmp_path / "motions"
+    motions.mkdir()
+    first = motions / "a.npz"
+    second = motions / "b.npz"
+    _write_motion(first, 2, 0.0)
+    _write_motion(second, 3, 1.0)
+    child = tmp_path / "child.yaml"
+    child.write_text("files:\n  - motions/a.npz\n  - motions/b.npz\n", encoding="utf-8")
+    root = tmp_path / "root.yaml"
+    root.write_text("files:\n  - child.yaml\n", encoding="utf-8")
+    cache = tmp_path / "cache" / "catalog.json"
+
+    expected = ([str(first), str(second)], [2, 3])
+    assert resolve_motion_catalog(root, cache_path=cache, max_workers=2) == expected
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["manifest"] == str(root)
+    assert {item["path"] for item in payload["manifest_dependencies"]} == {str(root), str(child)}
+    assert "motion_stats" not in payload
+
+    monkeypatch.setattr(
+        motion_data,
+        "_resolve_motion_files_and_dependencies",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cache hit resolved YAML")),
+    )
+    monkeypatch.setattr(
+        motion_data,
+        "read_motion_lengths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cache hit read NPZ headers")),
+    )
+    assert resolve_motion_catalog(root, cache_path=cache, max_workers=2) == expected
+
+
+def test_motion_catalog_cache_rebuilds_after_nested_manifest_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "a.npz"
+    second = tmp_path / "b.npz"
+    _write_motion(first, 2, 0.0)
+    _write_motion(second, 4, 1.0)
+    child = tmp_path / "child.yaml"
+    child.write_text("files:\n  - a.npz\n", encoding="utf-8")
+    root = tmp_path / "root.yaml"
+    root.write_text("files:\n  - child.yaml\n", encoding="utf-8")
+    cache = tmp_path / "catalog.json"
+
+    calls = 0
+    original_read_lengths = motion_data.read_motion_lengths
+
+    def counted_read_lengths(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_read_lengths(*args, **kwargs)
+
+    monkeypatch.setattr(motion_data, "read_motion_lengths", counted_read_lengths)
+    assert resolve_motion_catalog(root, cache_path=cache) == ([str(first)], [2])
+    assert calls == 1
+
+    child.write_text("files:\n  - b.npz\n", encoding="utf-8")
+    assert resolve_motion_catalog(root, cache_path=cache) == ([str(second)], [4])
+    assert calls == 2
+
+
+def test_motion_catalog_cache_recovers_from_corrupt_json(tmp_path: Path) -> None:
+    motion = tmp_path / "motion.npz"
+    _write_motion(motion, 3, 0.0)
+    manifest = tmp_path / "motions.yaml"
+    manifest.write_text("files:\n  - motion.npz\n", encoding="utf-8")
+    cache = tmp_path / "catalog.json"
+    cache.write_text("{not valid json", encoding="utf-8")
+
+    assert resolve_motion_catalog(manifest, cache_path=cache) == ([str(motion)], [3])
+    assert json.loads(cache.read_text(encoding="utf-8"))["motion_lengths"] == [3]
+
+
+def test_motion_catalog_direct_npz_cache_invalidates_on_file_change(tmp_path: Path) -> None:
+    motion = tmp_path / "motion.npz"
+    cache = tmp_path / "catalog.json"
+    _write_motion(motion, 2, 0.0)
+    assert resolve_motion_catalog(motion, cache_path=cache) == ([str(motion)], [2])
+
+    _write_motion(motion, 5, 0.0)
+    assert resolve_motion_catalog(motion, cache_path=cache) == ([str(motion)], [5])
+
+
+def test_motion_catalog_reclaims_dead_same_host_lock(tmp_path: Path) -> None:
+    motion = tmp_path / "motion.npz"
+    _write_motion(motion, 2, 0.0)
+    manifest = tmp_path / "motions.yaml"
+    manifest.write_text("files:\n  - motion.npz\n", encoding="utf-8")
+    cache = tmp_path / "catalog.json"
+    lock = tmp_path / "catalog.json.lock"
+    lock.write_text(
+        json.dumps(
+            {
+                "token": "abandoned",
+                "hostname": socket.gethostname(),
+                "pid": 2**31 - 1,
+                "created_ns": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert resolve_motion_catalog(manifest, cache_path=cache) == ([str(motion)], [2])
+    assert not lock.exists()
+
+
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="requires fork")
+def test_motion_catalog_concurrent_processes_build_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    motions = []
+    for index, frames in enumerate((2, 3, 4)):
+        path = tmp_path / f"motion-{index}.npz"
+        _write_motion(path, frames, float(index))
+        motions.append(path)
+    manifest = tmp_path / "motions.yaml"
+    manifest.write_text(
+        "files:\n" + "".join(f"  - {path.name}\n" for path in motions),
+        encoding="utf-8",
+    )
+    cache = tmp_path / "catalog.json"
+    build_log = tmp_path / "catalog-builds.txt"
+    original_read_lengths = motion_data.read_motion_lengths
+
+    def logged_read_lengths(*args, **kwargs):
+        with build_log.open("a", encoding="utf-8") as stream:
+            stream.write(f"{multiprocessing.current_process().pid}\n")
+        return original_read_lengths(*args, **kwargs)
+
+    monkeypatch.setattr(motion_data, "read_motion_lengths", logged_read_lengths)
+    context = multiprocessing.get_context("fork")
+    start_event = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_resolve_catalog_process,
+            args=(str(manifest), str(cache), start_event, results),
+        )
+        for _ in range(4)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+
+    expected = ([str(path) for path in motions], [2, 3, 4])
+    assert [results.get(timeout=2) for _ in processes] == [expected] * len(processes)
+    assert len(build_log.read_text(encoding="utf-8").splitlines()) == 1
+    assert not cache.with_name(f"{cache.name}.lock").exists()
 
 
 def test_rank_shards_are_disjoint_complete_and_use_global_rank() -> None:
