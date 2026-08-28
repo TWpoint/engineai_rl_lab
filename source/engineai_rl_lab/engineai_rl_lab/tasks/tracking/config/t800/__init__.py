@@ -407,6 +407,96 @@ gym.register(
 )
 
 gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v18-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v18:T800FlatWoStateEstimationEnvCfgV18Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v18:T800FlatV18ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v19-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v19:T800FlatWoStateEstimationEnvCfgV19Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v19:T800FlatV19ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v20-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v20:T800FlatWoStateEstimationEnvCfgV20Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v20:T800FlatV20ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v21-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v21:T800FlatWoStateEstimationEnvCfgV21Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v21:T800FlatV21ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v22-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v22:T800FlatWoStateEstimationEnvCfgV22Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v22:T800FlatV22ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v23-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v23:T800FlatWoStateEstimationEnvCfgV23Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v23:T800FlatV23ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v24-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v24:T800FlatWoStateEstimationEnvCfgV24Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v24:T800FlatV24ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v25-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v25:T800FlatWoStateEstimationEnvCfgV25Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v25:T800FlatV25ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-Flat-T800-Wo-State-Estimation-v26-scale",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg_v26:T800FlatWoStateEstimationEnvCfgV26Scale",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_v26:T800FlatV26ScalePPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Tracking-Flat-T800-Low-Freq-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

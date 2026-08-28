@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 3 ]]; then
-    echo "Usage: $0 NODE_RANK [MASTER_ADDR] [MASTER_PORT]" >&2
+if [[ $# -lt 1 || $# -gt 4 ]]; then
+    echo "Usage: $0 NODE_RANK [MASTER_ADDR] [MASTER_PORT] [NUM_ENVS]" >&2
     exit 2
 fi
 
 v17_node_rank="$1"
 v17_master_addr="${2:-10.66.17.163}"
 v17_master_port="${3:-29507}"
+v17_num_envs="${4:-11264}"
 v17_project_dir="/mnt/workspace/lpz/engineai/engineai_rl_lab"
 v17_python="/mnt/workspace/lpz/engineai/engineai/bin/python"
 v17_load_run="2026-08-21_22-41-15_v16-scale"
@@ -25,12 +26,17 @@ case "$v17_node_rank" in
         ;;
 esac
 
-v17_log="${v17_project_dir}/v17_scale_resume_12250_3node_12000_${v17_node_name}.log"
+if [[ ! "$v17_num_envs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_ENVS must be a positive integer, got: ${v17_num_envs}" >&2
+    exit 2
+fi
+
+v17_log="${v17_project_dir}/v17_scale_resume_12250_3node_${v17_num_envs}_${v17_node_name}.log"
 
 cd "$v17_project_dir"
 exec > >(tee "$v17_log") 2>&1
 
-echo "[preflight] node=${v17_node_name} rank=${v17_node_rank} master=${v17_master_addr}:${v17_master_port}"
+echo "[preflight] node=${v17_node_name} rank=${v17_node_rank} master=${v17_master_addr}:${v17_master_port} envs=${v17_num_envs}"
 [[ -x "$v17_python" ]] || { echo "Missing Python: ${v17_python}" >&2; exit 1; }
 [[ -f "$v17_checkpoint_path" ]] || { echo "Missing checkpoint: ${v17_checkpoint_path}" >&2; exit 1; }
 
@@ -79,7 +85,7 @@ exec "$v17_python" -m torch.distributed.run \
     scripts/tracking/train.py \
     --task Tracking-Flat-T800-Wo-State-Estimation-v17-scale \
     --distributed \
-    --num_envs 12000 \
+    --num_envs "$v17_num_envs" \
     --seed 42 \
     --resume \
     --load_run "$v17_load_run" \
