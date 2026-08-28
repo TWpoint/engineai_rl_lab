@@ -18,6 +18,12 @@ def _get_body_indexes(command: MotionCommand, body_names: list[str] | None) -> l
     return [i for i, name in enumerate(command.cfg.body_names) if (body_names is None) or (name in body_names)]
 
 
+def _get_joint_indexes(command: MotionCommand, joint_names: list[str] | None) -> list[int]:
+    if joint_names is None:
+        return list(range(command.robot.num_joints))
+    return [command.robot.joint_names.index(name) for name in joint_names]
+
+
 def motion_global_anchor_position_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = torch.sum(torch.square(command.anchor_pos_w - command.robot_anchor_pos_w), dim=-1)
@@ -61,7 +67,9 @@ def motion_local_body_position_error_exp(
     orientation are removed independently from the reference and robot poses.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
-    body_indexes = _get_body_indexes(command, body_names)
+    # Preserve the requested point order so each optional offset remains paired
+    # with the body at the same position in ``body_names``.
+    body_indexes = [command.cfg.body_names.index(name) for name in body_names]
     num_bodies = len(body_indexes)
     ref_body_pos_w = command.body_pos_w[:, body_indexes]
     robot_body_pos_w = command.robot_body_pos_w[:, body_indexes]
@@ -140,6 +148,59 @@ def motion_global_body_angular_velocity_error_exp(
         torch.square(command.body_ang_vel_w[:, body_indexes] - command.robot_body_ang_vel_w[:, body_indexes]), dim=-1
     )
     return torch.exp(-error.mean(-1) / std**2)
+
+
+def motion_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    joint_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Reward reference joint-position tracking over the selected joints."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    joint_indexes = _get_joint_indexes(command, joint_names)
+    error = torch.mean(
+        torch.square(command.joint_pos[:, joint_indexes] - command.robot_joint_pos[:, joint_indexes]),
+        dim=-1,
+    )
+    return torch.exp(-error / std**2)
+
+
+def motion_joint_velocity_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    joint_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Reward reference joint-velocity tracking over the selected joints."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    joint_indexes = _get_joint_indexes(command, joint_names)
+    error = torch.mean(
+        torch.square(command.joint_vel[:, joint_indexes] - command.robot_joint_vel[:, joint_indexes]),
+        dim=-1,
+    )
+    return torch.exp(-error / std**2)
+
+
+def joint_pos_limits_capped(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    max_error_per_joint: float = 1.0,
+    max_total_error: float = 1.0,
+) -> torch.Tensor:
+    """Penalize soft-limit violations without allowing one bad state to dominate a rollout."""
+    if max_error_per_joint <= 0.0:
+        raise ValueError("max_error_per_joint must be positive")
+    if max_total_error <= 0.0:
+        raise ValueError("max_total_error must be positive")
+    asset = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos.torch[:, asset_cfg.joint_ids]
+    limits = asset.data.soft_joint_pos_limits.torch[:, asset_cfg.joint_ids]
+    below_lower = (limits[..., 0] - joint_pos).clamp_(min=0.0, max=max_error_per_joint)
+    above_upper = (joint_pos - limits[..., 1]).clamp_(min=0.0, max=max_error_per_joint)
+    total_error = torch.sum(below_lower + above_upper, dim=1)
+    total_error = torch.nan_to_num(total_error, nan=max_total_error, posinf=max_total_error, neginf=0.0)
+    return total_error.clamp_(max=max_total_error)
 
 
 def feet_contact_time(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:

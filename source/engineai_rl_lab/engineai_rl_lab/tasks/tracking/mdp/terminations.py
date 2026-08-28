@@ -128,9 +128,11 @@ def bad_motion_body_pos_z_adaptive(
 def nonfinite_robot_state(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """Terminate environments whose simulated robot state contains NaN or Inf.
 
-    A diverged physics state must be reset before observations are computed.  In
-    particular, comparisons in the geometric termination terms do not catch NaN
-    because every ordered comparison with NaN evaluates to false.
+    Large finite velocities are useful diagnostics, but they are not necessarily
+    solver failures: the existing T800 policies can transiently exceed the motor
+    datasheet limit and recover.  Keep this termination's contract strictly
+    non-finite so it does not turn those recoverable transitions into false
+    ``invalid_robot_state`` events.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     state_tensors = (

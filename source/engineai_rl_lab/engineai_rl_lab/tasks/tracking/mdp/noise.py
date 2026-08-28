@@ -42,7 +42,11 @@ def _resolve_joint_noise_ranges(data: torch.Tensor, cfg: Unoise) -> None:
             "Use it from an IsaacLab observation term after the ObservationManager is initialized."
         )
 
-    joint_names = list(env.scene[cfg.asset_name].joint_names)
+    asset = env.scene[cfg.asset_name]
+    if cfg.joint_names is None:
+        joint_names = list(asset.joint_names)
+    else:
+        _, joint_names = asset.find_joints(cfg.joint_names, preserve_order=True)
     if data.shape[-1] != len(joint_names):
         raise ValueError(
             f"Joint-wise Unoise expected the observation last dimension to match "
@@ -86,6 +90,8 @@ class Unoise(UniformNoiseCfg):
     func = joint_uniform_noise
 
     asset_name: str = "robot"
+    joint_names: list[str] | None = None
+    """Joint names represented by the observation, or all asset joints when unset."""
     default_n_min: float = -0.5
     default_n_max: float = 0.5
     joint_noise_scales: dict[str, float] | None = None

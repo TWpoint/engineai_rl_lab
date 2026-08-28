@@ -49,6 +49,15 @@ parser.add_argument(
     default=False,
     help="Disable randomization and sampling adaptation to overfit one --motion_file .npz trajectory.",
 )
+parser.add_argument(
+    "--invalid_state_snapshot_dir",
+    type=str,
+    default=None,
+    help=(
+        "Opt-in directory for invalid_robot_state and finite-runaway diagnostic snapshots "
+        "(zero recorder overhead when omitted)."
+    ),
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -68,6 +77,8 @@ from datetime import datetime
 
 import gymnasium as gym
 import torch
+from engineai_rl_lab.tasks.tracking.mdp.recorders import InvalidRobotStateRecorderManagerCfg
+from engineai_rl_lab.utils.finite_reset import FiniteResetRslRlVecEnvWrapper
 from engineai_rl_lab.utils.my_on_policy_runner import MotionOnPolicyRunner as OnPolicyRunner
 
 from isaaclab.app import launch_simulation
@@ -81,7 +92,7 @@ from isaaclab.envs import (
 from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.entrypoints.common import apply_video_recording, pre_launch_video_config
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, handle_deprecated_rsl_rl_cfg
 
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -150,19 +161,6 @@ def configure_rank_cpu_runtime() -> None:
     torch.set_num_threads(max(1, min(thread_count, len(rank_cpus))))
     with contextlib.suppress(RuntimeError):
         torch.set_num_interop_threads(1)
-
-
-class FiniteResetRslRlVecEnvWrapper(RslRlVecEnvWrapper):
-    """Keep terminal rewards finite after resetting a diverged physics state."""
-
-    def step(self, actions: torch.Tensor):
-        observations, rewards, dones, extras = super().step(actions)
-        # A non-finite state is now terminated and reset before observations are
-        # returned. Reward computation precedes that reset, so sanitize only the
-        # rewards belonging to terminal environments. Non-terminal NaNs remain
-        # untouched and are still rejected by RSL-RL's checker.
-        rewards = torch.where(dones.bool() & ~torch.isfinite(rewards), torch.zeros_like(rewards), rewards)
-        return observations, rewards, dones, extras
 
 
 def dump_pickle(filename: str, data: object):
@@ -239,6 +237,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
+    global_rank = int(os.getenv("RANK", "0")) if args_cli.distributed else 0
+
+    if args_cli.invalid_state_snapshot_dir is not None:
+        recorder_cfg = InvalidRobotStateRecorderManagerCfg()
+        recorder_cfg.invalid_robot_state.snapshot_dir = os.path.abspath(args_cli.invalid_state_snapshot_dir)
+        recorder_cfg.invalid_robot_state.snapshot_context = pathlib.Path(log_dir).name
+        env_cfg.recorders = recorder_cfg
+        print(
+            "[INFO] Raw invalid-state snapshots enabled at "
+            f"{recorder_cfg.invalid_robot_state.snapshot_dir}"
+        )
 
     pre_launch_video_config(env_cfg, args_cli=args_cli)
     with launch_simulation(env_cfg, args_cli):
@@ -246,51 +255,64 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # distributed runs. RSL-RL must use the same device, and each rank needs a
         # distinct seed to avoid collecting identical rollouts.
         if args_cli.distributed:
-            global_rank = int(os.getenv("RANK", "0"))
             agent_cfg.device = env_cfg.sim.device
             env_cfg.seed = agent_cfg.seed + global_rank
             agent_cfg.seed = env_cfg.seed
 
         env_cfg.log_dir = log_dir
         apply_video_recording(env_cfg, log_dir, args_cli)
-        # create isaac environment after the requested physics backend has been launched
-        env = gym.make(args_cli.task, cfg=env_cfg)
+        env = None
+        try:
+            # create isaac environment after the requested physics backend has been launched
+            env = gym.make(args_cli.task, cfg=env_cfg)
 
-        # convert to single-agent instance if required by the RL algorithm
-        if isinstance(env.unwrapped, DirectMARLEnv):
-            env = multi_agent_to_single_agent(env)
+            # convert to single-agent instance if required by the RL algorithm
+            if isinstance(env.unwrapped, DirectMARLEnv):
+                env = multi_agent_to_single_agent(env)
 
-        # wrap around environment for rsl-rl
-        env = FiniteResetRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+            # wrap around environment for rsl-rl
+            env = FiniteResetRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-        # create runner from rsl-rl
-        train_cfg = sanitize_rsl_rl_cfg(agent_cfg.to_dict())
-        runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device=agent_cfg.device, registry_name=registry_name)
-        # write git state to logs
-        runner.add_git_repo_to_log(__file__)
-        # save resume path before creating a new log_dir
-        if agent_cfg.resume:
-            # get path to previous checkpoint
-            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-            print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-            # load previously trained model
-            runner.load(resume_path)
+            # create runner from rsl-rl
+            train_cfg = sanitize_rsl_rl_cfg(agent_cfg.to_dict())
+            runner = OnPolicyRunner(
+                env,
+                train_cfg,
+                log_dir=log_dir,
+                device=agent_cfg.device,
+                registry_name=registry_name,
+            )
+            # write git state to logs
+            runner.add_git_repo_to_log(__file__)
+            # save resume path before creating a new log_dir
+            if agent_cfg.resume:
+                # get path to previous checkpoint
+                resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+                print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+                # load previously trained model
+                runner.load(resume_path)
 
-        # dump the configuration into log-directory
-        dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-        dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-        dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
-        dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+            # Only the logging rank owns the canonical run directory. This
+            # prevents all distributed workers from concurrently overwriting
+            # the same YAML/pickle files when their timestamps coincide.
+            if global_rank == 0:
+                dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+                dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+                dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
+                dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
-        # run training
-        runner.learn(
-            num_learning_iterations=agent_cfg.max_iterations,
-            init_at_random_ep_len=agent_cfg.init_at_random_ep_len,
-        )
-
-        env.close()
-        if args_cli.distributed and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+            # run training
+            runner.learn(
+                num_learning_iterations=agent_cfg.max_iterations,
+                init_at_random_ep_len=agent_cfg.init_at_random_ep_len,
+            )
+        finally:
+            try:
+                if env is not None:
+                    env.close()
+            finally:
+                if args_cli.distributed and torch.distributed.is_initialized():
+                    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

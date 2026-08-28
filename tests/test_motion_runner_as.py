@@ -44,6 +44,7 @@ def test_runner_syncs_on_save_boundary_and_when_forced() -> None:
 
 
 def _make_learn_runner(sync_calls: list[tuple[int, bool]]) -> SimpleNamespace:
+    unwrapped_env = SimpleNamespace()
     policy = SimpleNamespace(output_std=torch.tensor([1.0]))
     alg = SimpleNamespace(
         train_mode=lambda: None,
@@ -54,11 +55,12 @@ def _make_learn_runner(sync_calls: list[tuple[int, bool]]) -> SimpleNamespace:
     )
     logger = SimpleNamespace(
         writer=None,
+        ep_extras=[],
         init_logging_writer=lambda: None,
         log=lambda **kwargs: None,
     )
     return SimpleNamespace(
-        env=SimpleNamespace(get_observations=lambda: torch.tensor([0.0])),
+        env=SimpleNamespace(unwrapped=unwrapped_env, get_observations=lambda: torch.tensor([0.0])),
         device="cpu",
         alg=alg,
         is_distributed=False,

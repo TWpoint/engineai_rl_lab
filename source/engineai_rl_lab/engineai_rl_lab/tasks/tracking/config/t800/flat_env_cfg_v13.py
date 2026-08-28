@@ -80,9 +80,13 @@ class T800BeyondMinicRewardsCfg:
     )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.05)
     joint_limit = RewTerm(
-        func=mdp.joint_pos_limits,
+        func=mdp.joint_pos_limits_capped,
         weight=-10.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "max_error_per_joint": 1.0,
+            "max_total_error": 1.0,
+        },
     )
 
 

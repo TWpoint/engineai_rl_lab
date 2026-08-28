@@ -4,6 +4,7 @@ from dataclasses import MISSING
 
 import numpy as np
 import trimesh
+from isaaclab_ov.physics import OvPhysxCfg
 
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
@@ -24,7 +25,6 @@ from isaaclab.utils.configclass import configclass
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab.visualizers import VisualizerCfg
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
-from isaaclab_ov.physics import OvPhysxCfg
 from isaaclab_physx.physics import PhysxCfg
 
 from isaaclab_tasks.utils import PresetCfg
@@ -56,7 +56,10 @@ class TrackingPhysicsCfg(PresetCfg):
         collision_cfg=NewtonCollisionPipelineCfg(max_triangle_pairs=2_500_000),
         num_substeps=1,
         debug_mode=False,
-        default_shape_cfg=NewtonShapeCfg(margin=0.0, ke=160000.0, kd=1100.0),
+        # Even the flat tracking ground is a triangle mesh.  Newton requires a
+        # nonzero collision margin for stable mesh contact; keep every other
+        # contact parameter unchanged so this remains a single-variable A/B.
+        default_shape_cfg=NewtonShapeCfg(margin=0.01, ke=160000.0, kd=1100.0),
     )
     default = isaacsim_physx
 
@@ -287,9 +290,13 @@ class RewardsCfg:
     )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
     joint_limit = RewTerm(
-        func=mdp.joint_pos_limits,
+        func=mdp.joint_pos_limits_capped,
         weight=-10.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "max_error_per_joint": 1.0,
+            "max_total_error": 1.0,
+        },
     )
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
